@@ -317,10 +317,10 @@ string readLine(int fd)
         if (rd == -1) {
             if (errno != EINTR)
                 throw SysError("reading a line");
-        } else if (rd == 0)
+        } else if (rd == 0) {
             if (!s.empty()) return s;
             throw EndOfFile("unexpected EOF reading a line");
-        else {
+        } else {
             if (ch == '\n') return s;
             s += ch;
         }
