@@ -222,11 +222,10 @@ Path Store::makeTextPath(const string & name, const Hash & hash,
 }
 
 
-std::pair<Path, Hash> Store::computeStorePathForPath(const Path & srcPath,
-    bool recursive, HashType hashAlgo, PathFilter & filter) const
+std::pair<Path, Hash> Store::computeStorePathForPath(const string & name,
+    const Path & srcPath, bool recursive, HashType hashAlgo, PathFilter & filter) const
 {
     Hash h = recursive ? hashPath(hashAlgo, srcPath, filter).first : hashFile(hashAlgo, srcPath);
-    string name = baseNameOf(srcPath);
     Path dstPath = makeFixedOutputPath(recursive, h, name);
     return std::pair<Path, Hash>(dstPath, h);
 }
@@ -389,8 +388,10 @@ PathSet Store::queryValidPaths(const PathSet & paths, SubstituteFlag maybeSubsti
     Sync<State> state_(State{paths.size(), PathSet()});
 
     std::condition_variable wakeup;
+    ThreadPool pool;
 
-    for (auto & path : paths)
+    auto doQuery = [&](const Path & path ) {
+        checkInterrupt();
         queryPathInfo(path,
             [path, &state_, &wakeup](ref<ValidPathInfo> info) {
                 auto state(state_.lock());
@@ -411,6 +412,12 @@ PathSet Store::queryValidPaths(const PathSet & paths, SubstituteFlag maybeSubsti
                 if (!--state->left)
                     wakeup.notify_one();
             });
+    };
+
+    for (auto & path : paths)
+        pool.enqueue(std::bind(doQuery, path));
+
+    pool.process();
 
     while (true) {
         auto state(state_.lock());
@@ -508,6 +515,8 @@ void Store::pathInfoToJSON(JSONPlaceholder & jsonOut, const PathSet & storePaths
                     std::shared_ptr<const ValidPathInfo>(info));
 
                 if (narInfo) {
+                    if (!narInfo->url.empty())
+                        jsonPath.attr("url", narInfo->url);
                     if (narInfo->fileHash)
                         jsonPath.attr("downloadHash", narInfo->fileHash.to_string());
                     if (narInfo->fileSize)
@@ -565,40 +574,31 @@ void Store::buildPaths(const PathSet & paths, BuildMode buildMode)
 void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
     const Path & storePath, RepairFlag repair, CheckSigsFlag checkSigs)
 {
-    Activity act(*logger, lvlInfo, actCopyPath, fmt("copying path '%s'", storePath),
-        {storePath, srcStore->getUri(), dstStore->getUri()});
+    auto srcUri = srcStore->getUri();
+    auto dstUri = dstStore->getUri();
+
+    Activity act(*logger, lvlInfo, actCopyPath,
+        srcUri == "local" || srcUri == "daemon"
+          ? fmt("copying path '%s' to '%s'", storePath, dstUri)
+          : dstUri == "local" || dstUri == "daemon"
+            ? fmt("copying path '%s' from '%s'", storePath, srcUri)
+            : fmt("copying path '%s' from '%s' to '%s'", storePath, srcUri, dstUri),
+        {storePath, srcUri, dstUri});
     PushActivity pact(act.id);
 
     auto info = srcStore->queryPathInfo(storePath);
 
     uint64_t total = 0;
 
-    auto progress = [&](size_t len) {
-        total += len;
-        act.progress(total, info->narSize);
-    };
-
-    struct MyStringSink : StringSink
-    {
-        typedef std::function<void(size_t)> Callback;
-        Callback callback;
-        MyStringSink(Callback callback) : callback(callback) { }
-        void operator () (const unsigned char * data, size_t len) override
-        {
-            StringSink::operator ()(data, len);
-            callback(len);
-        };
-    };
-
-    MyStringSink sink(progress);
-    srcStore->narFromPath({storePath}, sink);
-
+    // FIXME
+#if 0
     if (!info->narHash) {
         auto info2 = make_ref<ValidPathInfo>(*info);
         info2->narHash = hashString(htSHA256, *sink.s);
         if (!info->narSize) info2->narSize = sink.s->size();
         info = info2;
     }
+#endif
 
     if (info->ultimate) {
         auto info2 = make_ref<ValidPathInfo>(*info);
@@ -606,7 +606,16 @@ void copyStorePath(ref<Store> srcStore, ref<Store> dstStore,
         info = info2;
     }
 
-    dstStore->addToStore(*info, sink.s, repair, checkSigs);
+    auto source = sinkToSource([&](Sink & sink) {
+        LambdaSink wrapperSink([&](const unsigned char * data, size_t len) {
+            sink(data, len);
+            total += len;
+            act.progress(total, info->narSize);
+        });
+        srcStore->narFromPath({storePath}, wrapperSink);
+    });
+
+    dstStore->addToStore(*info, *source, repair, checkSigs);
 }
 
 
@@ -618,6 +627,8 @@ void copyPaths(ref<Store> srcStore, ref<Store> dstStore, const PathSet & storePa
     PathSet missing;
     for (auto & path : storePaths)
         if (!valid.count(path)) missing.insert(path);
+
+    if (missing.empty()) return;
 
     Activity act(*logger, lvlInfo, actCopyPaths, fmt("copying %d paths", missing.size()));
 
@@ -789,6 +800,21 @@ std::string makeFixedOutputCA(bool recursive, const Hash & hash)
 }
 
 
+void Store::addToStore(const ValidPathInfo & info, Source & narSource,
+    RepairFlag repair, CheckSigsFlag checkSigs,
+    std::shared_ptr<FSAccessor> accessor)
+{
+    addToStore(info, make_ref<std::string>(narSource.drain()), repair, checkSigs, accessor);
+}
+
+void Store::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+    RepairFlag repair, CheckSigsFlag checkSigs,
+    std::shared_ptr<FSAccessor> accessor)
+{
+    StringSource source(*nar);
+    addToStore(info, source, repair, checkSigs, accessor);
+}
+
 }
 
 
@@ -820,7 +846,7 @@ ref<Store> openStore(const std::string & uri_,
     for (auto fun : *RegisterStoreImplementation::implementations) {
         auto store = fun(uri, params);
         if (store) {
-            store->warnUnknownSettings();
+            store->handleUnknownSettings();
             return ref<Store>(store);
         }
     }
@@ -833,7 +859,7 @@ StoreType getStoreType(const std::string & uri, const std::string & stateDir)
 {
     if (uri == "daemon") {
         return tDaemon;
-    } else if (uri == "local") {
+    } else if (uri == "local" || hasPrefix(uri, "/")) {
         return tLocal;
     } else if (uri == "" || uri == "auto") {
         if (access(stateDir.c_str(), R_OK | W_OK) == 0)
@@ -855,8 +881,12 @@ static RegisterStoreImplementation regStore([](
     switch (getStoreType(uri, get(params, "state", settings.nixStateDir))) {
         case tDaemon:
             return std::shared_ptr<Store>(std::make_shared<UDSRemoteStore>(params));
-        case tLocal:
-            return std::shared_ptr<Store>(std::make_shared<LocalStore>(params));
+        case tLocal: {
+            Store::Params params2 = params;
+            if (hasPrefix(uri, "/"))
+                params2["root"] = uri;
+            return std::shared_ptr<Store>(std::make_shared<LocalStore>(params2));
+        }
         default:
             return nullptr;
     }
@@ -873,7 +903,11 @@ std::list<ref<Store>> getDefaultSubstituters()
         auto addStore = [&](const std::string & uri) {
             if (done.count(uri)) return;
             done.insert(uri);
-            stores.push_back(openStore(uri));
+            try {
+                stores.push_back(openStore(uri));
+            } catch (Error & e) {
+                printError("warning: %s", e.what());
+            }
         };
 
         for (auto uri : settings.substituters.get())

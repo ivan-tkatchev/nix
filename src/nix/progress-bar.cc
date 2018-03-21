@@ -3,8 +3,9 @@
 #include "sync.hh"
 #include "store-api.hh"
 
-#include <map>
 #include <atomic>
+#include <map>
+#include <thread>
 
 namespace nix {
 
@@ -20,44 +21,6 @@ static uint64_t getI(const std::vector<Logger::Field> & fields, size_t n)
     assert(n < fields.size());
     assert(fields[n].type == Logger::Field::tInt);
     return fields[n].i;
-}
-
-/* Truncate a string to 'width' printable characters. ANSI escape
-   sequences are copied but not included in the character count. Also,
-   tabs are expanded to spaces. */
-static std::string ansiTruncate(const std::string & s, int width)
-{
-    if (width <= 0) return s;
-
-    std::string t;
-    size_t w = 0;
-    auto i = s.begin();
-
-    while (w < (size_t) width && i != s.end()) {
-        if (*i == '\e') {
-            t += *i++;
-            if (i != s.end() && *i == '[') {
-                t += *i++;
-                while (i != s.end() && (*i < 0x40 || *i > 0x7e)) {
-                    t += *i++;
-                }
-                if (i != s.end()) t += *i++;
-            }
-        }
-
-        else if (*i == '\t') {
-            t += ' '; w++;
-            while (w < (size_t) width && w & 8) {
-                t += ' '; w++;
-            }
-        }
-
-        else {
-            t += *i++; w++;
-        }
-    }
-
-    return t;
 }
 
 class ProgressBar : public Logger
@@ -101,15 +64,28 @@ private:
 
     Sync<State> state_;
 
+    std::thread updateThread;
+
+    std::condition_variable quitCV, updateCV;
+
 public:
 
     ProgressBar()
     {
+        updateThread = std::thread([&]() {
+            auto state(state_.lock());
+            while (state->active) {
+                state.wait(updateCV);
+                draw(*state);
+                state.wait_for(quitCV, std::chrono::milliseconds(50));
+            }
+        });
     }
 
     ~ProgressBar()
     {
         stop();
+        updateThread.join();
     }
 
     void stop()
@@ -121,6 +97,8 @@ public:
         writeToStderr("\r\e[K");
         if (status != "")
             writeToStderr("[" + status + "]\n");
+        updateCV.notify_one();
+        quitCV.notify_one();
     }
 
     void log(Verbosity lvl, const FormatOrString & fs) override
@@ -132,7 +110,7 @@ public:
     void log(State & state, Verbosity lvl, const std::string & s)
     {
         writeToStderr("\r\e[K" + s + ANSI_NORMAL "\n");
-        update(state);
+        draw(state);
     }
 
     void startActivity(ActivityId act, Verbosity lvl, ActivityType type,
@@ -156,16 +134,28 @@ public:
             if (hasSuffix(name, ".drv"))
                 name.resize(name.size() - 4);
             i->s = fmt("building " ANSI_BOLD "%s" ANSI_NORMAL, name);
+            auto machineName = getS(fields, 1);
+            if (machineName != "")
+                i->s += fmt(" on " ANSI_BOLD "%s" ANSI_NORMAL, machineName);
+            auto curRound = getI(fields, 2);
+            auto nrRounds = getI(fields, 3);
+            if (nrRounds != 1)
+                i->s += fmt(" (round %d/%d)", curRound, nrRounds);
         }
 
         if (type == actSubstitute) {
             auto name = storePathToName(getS(fields, 0));
-            i->s = fmt("fetching " ANSI_BOLD "%s" ANSI_NORMAL " from %s", name, getS(fields, 1));
+            auto sub = getS(fields, 1);
+            i->s = fmt(
+                hasPrefix(sub, "local")
+                ? "copying " ANSI_BOLD "%s" ANSI_NORMAL " from %s"
+                : "fetching " ANSI_BOLD "%s" ANSI_NORMAL " from %s",
+                name, sub);
         }
 
         if (type == actQueryPathInfo) {
             auto name = storePathToName(getS(fields, 0));
-            i->s = fmt("querying about " ANSI_BOLD "%s" ANSI_NORMAL " on %s", name, getS(fields, 1));
+            i->s = fmt("querying " ANSI_BOLD "%s" ANSI_NORMAL " on %s", name, getS(fields, 1));
         }
 
         if ((type == actDownload && hasAncestor(*state, actCopyPath, parent))
@@ -173,7 +163,7 @@ public:
             || (type == actCopyPath && hasAncestor(*state, actSubstitute, parent)))
             i->visible = false;
 
-        update(*state);
+        update();
     }
 
     /* Check whether an activity has an ancestore with the specified
@@ -208,7 +198,7 @@ public:
             state->its.erase(i);
         }
 
-        update(*state);
+        update();
     }
 
     void result(ActivityId act, ResultType type, const std::vector<Field> & fields) override
@@ -218,7 +208,7 @@ public:
         if (type == resFileLinked) {
             state->filesLinked++;
             state->bytesLinked += getI(fields, 0);
-            update(*state);
+            update();
         }
 
         else if (type == resBuildLogLine) {
@@ -231,25 +221,25 @@ public:
                 info.lastLine = lastLine;
                 state->activities.emplace_back(info);
                 i->second = std::prev(state->activities.end());
-                update(*state);
+                update();
             }
         }
 
         else if (type == resUntrustedPath) {
             state->untrustedPaths++;
-            update(*state);
+            update();
         }
 
         else if (type == resCorruptedPath) {
             state->corruptedPaths++;
-            update(*state);
+            update();
         }
 
         else if (type == resSetPhase) {
             auto i = state->its.find(act);
             assert(i != state->its.end());
             i->second->phase = getS(fields, 0);
-            update(*state);
+            update();
         }
 
         else if (type == resProgress) {
@@ -260,7 +250,7 @@ public:
             actInfo.expected = getI(fields, 1);
             actInfo.running = getI(fields, 2);
             actInfo.failed = getI(fields, 3);
-            update(*state);
+            update();
         }
 
         else if (type == resSetExpected) {
@@ -272,17 +262,16 @@ public:
             state->activitiesByType[type].expected -= j;
             j = getI(fields, 1);
             state->activitiesByType[type].expected += j;
-            update(*state);
+            update();
         }
     }
 
     void update()
     {
-        auto state(state_.lock());
-        update(*state);
+        updateCV.notify_one();
     }
 
-    void update(State & state)
+    void draw(State & state)
     {
         if (!state.active) return;
 
@@ -316,7 +305,10 @@ public:
             }
         }
 
-        writeToStderr("\r" + ansiTruncate(line, getWindowSize().second) + "\e[K");
+        auto width = getWindowSize().second;
+        if (width <= 0) std::numeric_limits<decltype(width)>::max();
+
+        writeToStderr("\r" + filterANSIEscapes(line, false, width) + "\e[K");
     }
 
     std::string getStatus(State & state)

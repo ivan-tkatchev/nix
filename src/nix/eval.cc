@@ -5,10 +5,11 @@
 #include "eval.hh"
 #include "json.hh"
 #include "value-to-json.hh"
+#include "progress-bar.hh"
 
 using namespace nix;
 
-struct CmdEval : MixJSON, InstallablesCommand
+struct CmdEval : MixJSON, InstallableCommand
 {
     bool raw = false;
 
@@ -42,6 +43,10 @@ struct CmdEval : MixJSON, InstallablesCommand
                 "To get the current version of Nixpkgs:",
                 "nix eval --raw nixpkgs.lib.nixpkgsVersion"
             },
+            Example{
+                "To print the store path of the Hello package:",
+                "nix eval --raw nixpkgs.hello"
+            },
         };
     }
 
@@ -52,20 +57,19 @@ struct CmdEval : MixJSON, InstallablesCommand
 
         auto state = getEvalState();
 
-        auto jsonOut = json ? std::make_unique<JSONList>(std::cout) : nullptr;
+        auto v = installable->toValue(*state);
+        PathSet context;
 
-        for (auto & i : installables) {
-            auto v = i->toValue(*state);
-            if (raw) {
-                std::cout << state->forceString(*v);
-            } else if (json) {
-                PathSet context;
-                auto jsonElem = jsonOut->placeholder();
-                printValueAsJSON(*state, true, *v, jsonElem, context);
-            } else {
-                state->forceValueDeep(*v);
-                std::cout << *v << "\n";
-            }
+        stopProgressBar();
+
+        if (raw) {
+            std::cout << state->coerceToString(noPos, *v, context);
+        } else if (json) {
+            JSONPlaceholder jsonOut(std::cout);
+            printValueAsJSON(*state, true, *v, jsonOut, context);
+        } else {
+            state->forceValueDeep(*v);
+            std::cout << *v << "\n";
         }
     }
 };

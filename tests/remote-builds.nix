@@ -1,8 +1,8 @@
 # Test Nix's remote build feature.
 
-{ system, nix }:
+{ nixpkgs, system, nix }:
 
-with import <nixpkgs/nixos/lib/testing.nix> { inherit system; };
+with import (nixpkgs + "/nixos/lib/testing.nix") { inherit system; };
 
 makeTest (
 
@@ -46,13 +46,13 @@ in
           nix.buildMachines =
             [ { hostName = "slave1";
                 sshUser = "root";
-                sshKey = "/root/.ssh/id_dsa";
+                sshKey = "/root/.ssh/id_ed25519";
                 system = "i686-linux";
                 maxJobs = 1;
               }
               { hostName = "slave2";
                 sshUser = "root";
-                sshKey = "/root/.ssh/id_dsa";
+                sshKey = "/root/.ssh/id_ed25519";
                 system = "i686-linux";
                 maxJobs = 1;
               }
@@ -70,10 +70,10 @@ in
       startAll;
 
       # Create an SSH key on the client.
-      my $key = `${pkgs.openssh}/bin/ssh-keygen -t dsa -f key -N ""`;
+      my $key = `${pkgs.openssh}/bin/ssh-keygen -t ed25519 -f key -N ""`;
       $client->succeed("mkdir -p -m 700 /root/.ssh");
-      $client->copyFileFromHost("key", "/root/.ssh/id_dsa");
-      $client->succeed("chmod 600 /root/.ssh/id_dsa");
+      $client->copyFileFromHost("key", "/root/.ssh/id_ed25519");
+      $client->succeed("chmod 600 /root/.ssh/id_ed25519");
 
       # Install the SSH key on the slaves.
       $client->waitForUnit("network.target");
@@ -85,7 +85,10 @@ in
       }
 
       # Perform a build and check that it was performed on the slave.
-      my $out = $client->succeed("nix-build ${expr nodes.client.config 1}");
+      my $out = $client->succeed(
+        "nix-build ${expr nodes.client.config 1} 2> build-output",
+        "grep -q Hello build-output"
+      );
       $slave1->succeed("test -e $out");
 
       # And a parallel build.

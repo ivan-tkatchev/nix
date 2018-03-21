@@ -126,6 +126,17 @@ if builtins ? getEnv then builtins.getEnv "PATH" else ""</programlisting>
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.splitVersion</function>
+  <replaceable>s</replaceable></term>
+
+    <listitem><para>Split a string representing a version into its
+    components, by the same version splitting logic underlying the
+    version comparison in <link linkend="ssec-version-comparisons">
+    <command>nix-env -u</command></link>.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.concatLists</function>
   <replaceable>lists</replaceable></term>
 
@@ -134,6 +145,14 @@ if builtins ? getEnv then builtins.getEnv "PATH" else ""</programlisting>
 
   </varlistentry>
 
+  <varlistentry><term><function>builtins.concatStringsSep</function>
+  <replaceable>separator</replaceable> <replaceable>list</replaceable></term>
+
+    <listitem><para>Concatenate a list of strings with a separator
+    between each element, e.g. <literal>concatStringsSep "/"
+    ["usr" "local" "bin"] == "usr/local/bin"</literal></para></listitem>
+
+  </varlistentry>
 
   <varlistentry
   xml:id='builtin-currentSystem'><term><varname>builtins.currentSystem</varname></term>
@@ -264,13 +283,13 @@ stdenv.mkDerivation { … }
 
     Note that when obtaining the hash with <varname>nix-prefetch-url
     </varname> the option <varname>--unpack</varname> is required.
-    </para> 
-      
-    <para>This function can also verify the contents against a hash. 
-    In that case, the function takes a set instead of a URL. The set 
+    </para>
+
+    <para>This function can also verify the contents against a hash.
+    In that case, the function takes a set instead of a URL. The set
     requires the attribute <varname>url</varname> and the attribute
     <varname>sha256</varname>, e.g.
-      
+
 <programlisting>
 with import (fetchTarball {
   url = https://github.com/NixOS/nixpkgs-channels/archive/nixos-14.12.tar.gz;
@@ -279,7 +298,7 @@ with import (fetchTarball {
 
 stdenv.mkDerivation { … }
 </programlisting>
-      
+
     </para>
 
     <para>This function is not available if <link
@@ -300,8 +319,9 @@ stdenv.mkDerivation { … }
   </varlistentry>
 
 
-  <varlistentry><term><function>builtins.filterSource</function>
-  <replaceable>e1</replaceable> <replaceable>e2</replaceable></term>
+  <varlistentry xml:id='builtin-filterSource'>
+    <term><function>builtins.filterSource</function>
+    <replaceable>e1</replaceable> <replaceable>e2</replaceable></term>
 
     <listitem>
 
@@ -600,6 +620,16 @@ x: x + 456</programlisting>
   </varlistentry>
 
 
+  <varlistentry><term><function>builtins.isFloat</function>
+  <replaceable>e</replaceable></term>
+
+    <listitem><para>Return <literal>true</literal> if
+    <replaceable>e</replaceable> evaluates to a float, and
+    <literal>false</literal> otherwise.</para></listitem>
+
+  </varlistentry>
+
+
   <varlistentry><term><function>builtins.isBool</function>
   <replaceable>e</replaceable></term>
 
@@ -750,6 +780,75 @@ Evaluates to <literal>[ "foo" ]</literal>.
 
   </varlistentry>
 
+  <varlistentry>
+    <term>
+      <function>builtins.path</function>
+      <replaceable>args</replaceable>
+    </term>
+
+    <listitem>
+      <para>
+        An enrichment of the built-in path type, based on the attributes
+        present in <replaceable>args</replaceable>. All are optional
+        except <varname>path</varname>:
+      </para>
+
+      <variablelist>
+        <varlistentry>
+          <term>path</term>
+          <listitem>
+            <para>The underlying path.</para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>name</term>
+          <listitem>
+            <para>
+              The name of the path when added to the store. This can
+              used to reference paths that have nix-illegal characters
+              in their names, like <literal>@</literal>.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>filter</term>
+          <listitem>
+            <para>
+              A function of the type expected by
+              <link linkend="builtin-filterSource">builtins.filterSource</link>,
+              with the same semantics.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>recursive</term>
+          <listitem>
+            <para>
+              When <literal>false</literal>, when
+              <varname>path</varname> is added to the store it is with a
+              flat hash, rather than a hash of the NAR serialization of
+              the file. Thus, <varname>path</varname> must refer to a
+              regular file, not a directory. This allows similar
+              behavior to <literal>fetchurl</literal>. Defaults to
+              <literal>true</literal>.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>sha256</term>
+          <listitem>
+            <para>
+              When provided, this is the expected hash of the file at
+              the path. Evaluation will fail if the hash is incorrect,
+              and providing a hash allows
+              <literal>builtins.path</literal> to be used even when the
+              <literal>pure-eval</literal> nix config option is on.
+            </para>
+          </listitem>
+        </varlistentry>
+      </variablelist>
+    </listitem>
+  </varlistentry>
 
   <varlistentry><term><function>builtins.pathExists</function>
   <replaceable>path</replaceable></term>
@@ -1245,8 +1344,9 @@ stdenv.mkDerivation (rec {
     <replaceable>e</replaceable>, namely <literal>"int"</literal>,
     <literal>"bool"</literal>, <literal>"string"</literal>,
     <literal>"path"</literal>, <literal>"null"</literal>,
-    <literal>"set"</literal>, <literal>"list"</literal> or
-    <literal>"lambda"</literal>.</para></listitem>
+    <literal>"set"</literal>, <literal>"list"</literal>,
+    <literal>"lambda"</literal> or
+    <literal>"float"</literal>.</para></listitem>
 
   </varlistentry>
 

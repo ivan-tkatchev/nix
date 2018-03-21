@@ -2,6 +2,7 @@
 
 #include "types.hh"
 #include "config.hh"
+#include "util.hh"
 
 #include <map>
 #include <limits>
@@ -81,8 +82,14 @@ public:
     /* The directory where the main programs are stored. */
     Path nixBinDir;
 
+    /* The directory where the man pages are stored. */
+    Path nixManDir;
+
     /* File name of the socket the daemon listens to.  */
     Path nixDaemonSocketFile;
+
+    Setting<std::string> storeUri{this, getEnv("NIX_REMOTE", "auto"), "store",
+        "The default Nix store to use."};
 
     Setting<bool> keepFailed{this, false, "keep-failed",
         "Whether to keep temporary directories of failed builds."};
@@ -128,18 +135,16 @@ public:
         "The maximum duration in seconds that a builder can run. "
         "0 means infinity.", {"build-timeout"}};
 
-    Setting<bool> useBuildHook{this, true, "remote-builds",
-        "Whether to use build hooks (for distributed builds)."};
-
     PathSetting buildHook{this, true, nixLibexecDir + "/nix/build-remote", "build-hook",
         "The path of the helper program that executes builds to remote machines."};
 
-    Setting<std::string> builders{this, "", "builders",
+    Setting<std::string> builders{this, "@" + nixConfDir + "/machines", "builders",
         "A semicolon-separated list of build machines, in the format of nix.machines."};
 
-    Setting<Strings> builderFiles{this,
-        {nixConfDir + "/machines"}, "builder-files",
-        "A list of files specifying build machines."};
+    Setting<bool> buildersUseSubstitutes{this, false, "builders-use-substitutes",
+        "Whether build machines should use their own substitutes for obtaining "
+        "build dependencies if possible, rather than waiting for this host to "
+        "upload them."};
 
     Setting<off_t> reservedSize{this, 8 * 1024 * 1024, "gc-reserved-space",
         "Amount of reserved disk space for the garbage collector."};
@@ -153,7 +158,7 @@ public:
     Setting<bool> syncBeforeRegistering{this, false, "sync-before-registering",
         "Whether to call sync() before registering a path as valid."};
 
-    Setting<bool> useSubstitutes{this, true, "use-substitutes",
+    Setting<bool> useSubstitutes{this, true, "substitute",
         "Whether to use substitutes.",
         {"build-use-substitutes"}};
 
@@ -209,7 +214,8 @@ public:
     bool lockCPU;
 
     /* Whether to show a stack trace if Nix evaluation fails. */
-    bool showTrace = false;
+    Setting<bool> showTrace{this, false, "show-trace",
+        "Whether to show a stack trace on evaluation errors."};
 
     Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation",
         "Whether builtin functions that allow executing native code should be enabled."};
@@ -228,7 +234,10 @@ public:
 
     Setting<bool> restrictEval{this, false, "restrict-eval",
         "Whether to restrict file system access to paths in $NIX_PATH, "
-        "and to disallow fetching files from the network."};
+        "and network access to the URI prefixes listed in 'allowed-uris'."};
+
+    Setting<bool> pureEval{this, false, "pure-eval",
+        "Whether to restrict file system and network access to files specified by cryptographic hash."};
 
     Setting<size_t> buildRepeat{this, 0, "repeat",
         "The number of times to repeat a build in order to verify determinism.",
@@ -262,10 +271,11 @@ public:
     Setting<bool> enforceDeterminism{this, true, "enforce-determinism",
         "Whether to fail if repeated builds produce different output."};
 
-    Setting<Strings> binaryCachePublicKeys{this,
+    Setting<Strings> trustedPublicKeys{this,
         {"cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="},
-        "binary-cache-public-keys",
-        "Trusted public keys for secure substitution."};
+        "trusted-public-keys",
+        "Trusted public keys for secure substitution.",
+        {"binary-cache-public-keys"}};
 
     Setting<Strings> secretKeyFiles{this, {}, "secret-key-files",
         "Secret keys with which to sign local builds."};
@@ -274,14 +284,16 @@ public:
         "Number of parallel HTTP connections.",
         {"binary-caches-parallel-connections"}};
 
-    Setting<bool> enableHttp2{this, true, "enable-http2",
+    Setting<bool> enableHttp2{this, true, "http2",
         "Whether to enable HTTP/2 support."};
 
     Setting<unsigned int> tarballTtl{this, 60 * 60, "tarball-ttl",
         "How soon to expire files fetched by builtins.fetchTarball and builtins.fetchurl."};
 
-    Setting<std::string> signedBinaryCaches{this, "*", "signed-binary-caches",
-        "Obsolete."};
+    Setting<bool> requireSigs{this, true, "require-sigs",
+        "Whether to check that any non-content-addressed path added to the "
+        "Nix store has a valid signature (that is, one signed using a key "
+        "listed in 'trusted-public-keys'."};
 
     Setting<Strings> substituters{this,
         nixStore == "/nix/store" ? Strings{"https://cache.nixos.org/"} : Strings(),
@@ -336,6 +348,12 @@ public:
         "String appended to the user agent in HTTP requests."};
 
 #if __linux__
+    Setting<bool> filterSyscalls{this, true, "filter-syscalls",
+            "Whether to prevent certain dangerous system calls, such as "
+            "creation of setuid/setgid files or adding ACLs or extended "
+            "attributes. Only disable this if you're aware of the "
+            "security implications."};
+
     Setting<bool> allowNewPrivileges{this, false, "allow-new-privileges",
         "Whether builders can acquire new privileges by calling programs with "
         "setuid/setgid bits or with file capabilities."};
@@ -350,14 +368,30 @@ public:
     Setting<uint64_t> maxFree{this, std::numeric_limits<uint64_t>::max(), "max-free",
         "Stop deleting garbage when free disk space is above the specified amount."};
 
+    Setting<Strings> allowedUris{this, {}, "allowed-uris",
+        "Prefixes of URIs that builtin functions such as fetchurl and fetchGit are allowed to fetch."};
+
+    Setting<Paths> pluginFiles{this, {}, "plugin-files",
+        "Plugins to dynamically load at nix initialization time."};
 };
 
 
 // FIXME: don't use a global variable.
 extern Settings settings;
 
+/* This should be called after settings are initialized, but before
+   anything else */
+void initPlugins();
+
 
 extern const string nixVersion;
+
+struct RegisterSetting
+{
+    typedef std::vector<AbstractSetting *> SettingRegistrations;
+    static SettingRegistrations * settingRegistrations;
+    RegisterSetting(AbstractSetting * s);
+};
 
 
 }

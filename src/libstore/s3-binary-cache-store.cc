@@ -10,6 +10,9 @@
 #include "istringstream_nocopy.hh"
 
 #include <aws/core/Aws.h>
+#include <aws/core/VersionConfig.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/client/DefaultRetryStrategy.h>
 #include <aws/core/utils/logging/FormattedLogSystem.h>
@@ -77,9 +80,22 @@ static void initAWS()
     });
 }
 
-S3Helper::S3Helper(const string & region)
+S3Helper::S3Helper(const std::string & profile, const std::string & region)
     : config(makeConfig(region))
-    , client(make_ref<Aws::S3::S3Client>(*config, true, false))
+    , client(make_ref<Aws::S3::S3Client>(
+            profile == ""
+            ? std::dynamic_pointer_cast<Aws::Auth::AWSCredentialsProvider>(
+                std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>())
+            : std::dynamic_pointer_cast<Aws::Auth::AWSCredentialsProvider>(
+                std::make_shared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>(profile.c_str())),
+            *config,
+            // FIXME: https://github.com/aws/aws-sdk-cpp/issues/759
+#if AWS_VERSION_MAJOR == 1 && AWS_VERSION_MINOR < 3
+            false,
+#else
+            Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+#endif
+            false))
 {
 }
 
@@ -148,6 +164,7 @@ S3Helper::DownloadResult S3Helper::getObject(
 
 struct S3BinaryCacheStoreImpl : public S3BinaryCacheStore
 {
+    const Setting<std::string> profile{this, "", "profile", "The name of the AWS configuration profile to use."};
     const Setting<std::string> region{this, Aws::Region::US_EAST_1, "region", {"aws-region"}};
     const Setting<std::string> narinfoCompression{this, "", "narinfo-compression", "compression method for .narinfo files"};
     const Setting<std::string> lsCompression{this, "", "ls-compression", "compression method for .ls files"};
@@ -163,7 +180,7 @@ struct S3BinaryCacheStoreImpl : public S3BinaryCacheStore
         const Params & params, const std::string & bucketName)
         : S3BinaryCacheStore(params)
         , bucketName(bucketName)
-        , s3Helper(region)
+        , s3Helper(profile, region)
     {
         diskCache = getNarInfoDiskCache();
     }
@@ -241,8 +258,8 @@ struct S3BinaryCacheStoreImpl : public S3BinaryCacheStore
             auto & error = res.GetError();
             if (error.GetErrorType() == Aws::S3::S3Errors::RESOURCE_NOT_FOUND
                 || error.GetErrorType() == Aws::S3::S3Errors::NO_SUCH_KEY
-                || (error.GetErrorType() == Aws::S3::S3Errors::UNKNOWN // FIXME
-                    && error.GetMessage().find("404") != std::string::npos))
+                // If bucket listing is disabled, 404s turn into 403s
+                || error.GetErrorType() == Aws::S3::S3Errors::ACCESS_DENIED)
                 return false;
             throw Error(format("AWS error fetching '%s': %s") % path % error.GetMessage());
         }

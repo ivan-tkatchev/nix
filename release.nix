@@ -1,18 +1,20 @@
-{ nix ? { outPath = ./.; revCount = 1234; shortRev = "abcdef"; }
-, nixpkgs ? { outPath = <nixpkgs>; revCount = 1234; shortRev = "abcdef"; }
+{ nix ? builtins.fetchGit ./.
+, nixpkgs ? builtins.fetchGit { url = https://github.com/NixOS/nixpkgs-channels.git; ref = "nixos-18.03"; }
 , officialRelease ? false
 , systems ? [ "x86_64-linux" "i686-linux" "x86_64-darwin" "aarch64-linux" ]
 }:
 
 let
 
-  pkgs = import <nixpkgs> {};
+  pkgs = import nixpkgs { system = builtins.currentSystem or "x86_64-linux"; };
 
   jobs = rec {
 
 
     tarball =
       with pkgs;
+
+      with import ./release-common.nix { inherit pkgs; };
 
       releaseTools.sourceTarball {
         name = "nix-tarball";
@@ -21,30 +23,19 @@ let
         src = nix;
         inherit officialRelease;
 
-        buildInputs =
-          [ curl bison flex libxml2 libxslt
-            bzip2 xz brotli
-            pkgconfig sqlite libsodium boehmgc
-            docbook5 docbook5_xsl
-            autoconf-archive
-            git
-          ] ++ lib.optional stdenv.isLinux libseccomp;
+        buildInputs = tarballDeps ++ buildDeps;
 
         configureFlags = "--enable-gc";
 
         postUnpack = ''
-          # Clean up when building from a working tree.
-          if [[ -d $sourceRoot/.git ]]; then
-            git -C $sourceRoot clean -fd
-          fi
+          (cd source && find . -type f) | cut -c3- > source/.dist-files
+          cat source/.dist-files
         '';
 
         preConfigure = ''
           (cd perl ; autoreconf --install --force --verbose)
           # TeX needs a writable font cache.
           export VARTEXFONTS=$TMPDIR/texfonts
-
-          cp -rv ${nlohmann_json}/include/nlohmann src/nlohmann
         '';
 
         distPhase =
@@ -64,7 +55,9 @@ let
 
     build = pkgs.lib.genAttrs systems (system:
 
-      with import <nixpkgs> { inherit system; };
+      let pkgs = import nixpkgs { inherit system; }; in
+
+      with pkgs;
 
       with import ./release-common.nix { inherit pkgs; };
 
@@ -72,19 +65,7 @@ let
         name = "nix";
         src = tarball;
 
-        buildInputs =
-          [ curl
-            bzip2 xz brotli
-            openssl pkgconfig sqlite boehmgc
-
-          ]
-          ++ lib.optional stdenv.isLinux libseccomp
-          ++ lib.optional (stdenv.isLinux || stdenv.isDarwin) libsodium
-          ++ lib.optional (stdenv.isLinux || stdenv.isDarwin)
-            (aws-sdk-cpp.override {
-              apis = ["s3"];
-              customMemoryManagement = false;
-            });
+        buildInputs = buildDeps;
 
         configureFlags = configureFlags ++
           [ "--sysconfdir=/etc" ];
@@ -104,7 +85,7 @@ let
 
     perlBindings = pkgs.lib.genAttrs systems (system:
 
-      let pkgs = import <nixpkgs> { inherit system; }; in with pkgs;
+      let pkgs = import nixpkgs { inherit system; }; in with pkgs;
 
       releaseTools.nixBuild {
         name = "nix-perl";
@@ -129,8 +110,7 @@ let
 
     binaryTarball = pkgs.lib.genAttrs systems (system:
 
-      # FIXME: temporarily use a different branch for the Darwin build.
-      with import <nixpkgs> { inherit system; };
+      with import nixpkgs { inherit system; };
 
       let
         toplevel = builtins.getAttr system jobs.build;
@@ -139,7 +119,7 @@ let
 
       runCommand "nix-binary-tarball-${version}"
         { exportReferencesGraph = [ "closure1" toplevel "closure2" cacert ];
-          buildInputs = [ perl shellcheck ];
+          buildInputs = [ perl ] ++ lib.optional (system != "aarch64-linux") shellcheck;
           meta.description = "Distribution-independent Nix bootstrap binaries for ${system}";
         }
         ''
@@ -152,8 +132,10 @@ let
             --subst-var-by nix ${toplevel} \
             --subst-var-by cacert ${cacert}
 
-          shellcheck -e SC1090 $TMPDIR/install
-          shellcheck -e SC1091,SC2002 $TMPDIR/install-darwin-multi-user
+          if type -p shellcheck; then
+            shellcheck -e SC1090 $TMPDIR/install
+            shellcheck -e SC1091,SC2002 $TMPDIR/install-darwin-multi-user
+          fi
 
           chmod +x $TMPDIR/install
           chmod +x $TMPDIR/install-darwin-multi-user
@@ -173,17 +155,15 @@ let
 
 
     coverage =
-      with import <nixpkgs> { system = "x86_64-linux"; };
+      with pkgs;
+
+      with import ./release-common.nix { inherit pkgs; };
 
       releaseTools.coverageAnalysis {
         name = "nix-build";
         src = tarball;
 
-        buildInputs =
-          [ curl bzip2 openssl pkgconfig sqlite xz libsodium libseccomp
-            # These are for "make check" only:
-            graphviz libxml2 libxslt
-          ];
+        buildInputs = buildDeps;
 
         configureFlags = ''
           --disable-init-state
@@ -193,7 +173,7 @@ let
 
         doInstallCheck = true;
 
-        lcovFilter = [ "*/boost/*" "*-tab.*" ];
+        lcovFilter = [ "*/boost/*" "*-tab.*" "*/nlohmann/*" "*/linenoise/*" ];
 
         # We call `dot', and even though we just use it to
         # syntax-check generated dot files, it still requires some
@@ -217,20 +197,25 @@ let
 
     # System tests.
     tests.remoteBuilds = (import ./tests/remote-builds.nix rec {
+      inherit nixpkgs;
       nix = build.x86_64-linux; system = "x86_64-linux";
     });
 
     tests.nix-copy-closure = (import ./tests/nix-copy-closure.nix rec {
+      inherit nixpkgs;
       nix = build.x86_64-linux; system = "x86_64-linux";
     });
 
-    tests.setuid = pkgs.lib.genAttrs (pkgs.lib.filter (pkgs.lib.hasSuffix "-linux") systems) (system:
-      import ./tests/setuid.nix rec {
-        nix = build.${system}; inherit system;
-      });
+    tests.setuid = pkgs.lib.genAttrs
+      ["i686-linux" "x86_64-linux"]
+      (system:
+        import ./tests/setuid.nix rec {
+          inherit nixpkgs;
+          nix = build.${system}; inherit system;
+        });
 
     tests.binaryTarball =
-      with import <nixpkgs> { system = "x86_64-linux"; };
+      with import nixpkgs { system = "x86_64-linux"; };
       vmTools.runInLinuxImage (runCommand "nix-binary-tarball-test"
         { diskImage = vmTools.diskImages.ubuntu1204x86_64;
         }
@@ -249,7 +234,7 @@ let
         ''); # */
 
     tests.evalNixpkgs =
-      import <nixpkgs/pkgs/top-level/make-tarball.nix> {
+      import (nixpkgs + "/pkgs/top-level/make-tarball.nix") {
         inherit nixpkgs;
         inherit pkgs;
         nix = build.x86_64-linux;
@@ -303,7 +288,7 @@ let
   makeRPM =
     system: diskImageFun: extraPackages:
 
-    with import <nixpkgs> { inherit system; };
+    with import nixpkgs { inherit system; };
 
     releaseTools.rpmBuild rec {
       name = "nix-rpm";
@@ -312,7 +297,8 @@ let
         { extraPackages =
             [ "sqlite" "sqlite-devel" "bzip2-devel" "libcurl-devel" "openssl-devel" "xz-devel" "libseccomp-devel" ]
             ++ extraPackages; };
-      memSize = 1024;
+      # At most 2047MB can be simulated in qemu-system-i386
+      memSize = 2047;
       meta.schedulingPriority = 50;
       postRPMInstall = "cd /tmp/rpmout/BUILD/nix-* && make installcheck";
       #enableParallelBuilding = true;
@@ -325,7 +311,7 @@ let
   makeDeb =
     system: diskImageFun: extraPackages: extraDebPackages:
 
-    with import <nixpkgs> { inherit system; };
+    with import nixpkgs { inherit system; };
 
     releaseTools.debBuild {
       name = "nix-deb";

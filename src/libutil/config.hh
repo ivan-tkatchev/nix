@@ -48,25 +48,25 @@ private:
 
     Settings _settings;
 
-    StringMap initials;
+    StringMap extras;
 
 public:
 
     Config(const StringMap & initials)
-        : initials(initials)
+        : extras(initials)
     { }
 
     void set(const std::string & name, const std::string & value);
 
     void addSetting(AbstractSetting * setting);
 
-    void warnUnknownSettings();
+    void handleUnknownSettings();
 
     StringMap getSettings(bool overridenOnly = false);
 
     const Settings & _getSettings() { return _settings; }
 
-    void applyConfigFile(const Path & path, bool fatal = false);
+    void applyConfigFile(const Path & path);
 
     void resetOverriden();
 
@@ -141,6 +141,12 @@ public:
     virtual void assign(const T & v) { value = v; }
 
     void set(const std::string & str) override;
+
+    virtual void override(const T & v)
+    {
+        overriden = true;
+        value = v;
+    }
 
     std::string to_string() override;
 

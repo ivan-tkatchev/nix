@@ -24,11 +24,11 @@ void Command::printHelp(const string & programName, std::ostream & out)
 MultiCommand::MultiCommand(const Commands & _commands)
     : commands(_commands)
 {
-    expectedArgs.push_back(ExpectedArg{"command", 1, true, [=](Strings ss) {
+    expectedArgs.push_back(ExpectedArg{"command", 1, true, [=](std::vector<std::string> ss) {
         assert(!command);
-        auto i = commands.find(ss.front());
+        auto i = commands.find(ss[0]);
         if (i == commands.end())
-            throw UsageError(format("'%1%' is not a recognised command") % ss.front());
+            throw UsageError("'%s' is not a recognised command", ss[0]);
         command = i->second;
     }});
 }
@@ -78,9 +78,6 @@ bool MultiCommand::processArgs(const Strings & args, bool finish)
 
 StoreCommand::StoreCommand()
 {
-    storeUri = getEnv("NIX_REMOTE");
-
-    mkFlag(0, "store", "store-uri", "URI of the Nix store to use", &storeUri);
 }
 
 ref<Store> StoreCommand::getStore()
@@ -92,7 +89,7 @@ ref<Store> StoreCommand::getStore()
 
 ref<Store> StoreCommand::createStore()
 {
-    return openStore(storeUri);
+    return openStore();
 }
 
 void StoreCommand::run()
@@ -100,9 +97,21 @@ void StoreCommand::run()
     run(getStore());
 }
 
-StorePathsCommand::StorePathsCommand()
+StorePathsCommand::StorePathsCommand(bool recursive)
+    : recursive(recursive)
 {
-    mkFlag('r', "recursive", "apply operation to closure of the specified paths", &recursive);
+    if (recursive)
+        mkFlag()
+            .longName("no-recursive")
+            .description("apply operation to specified paths only")
+            .set(&this->recursive, false);
+    else
+        mkFlag()
+            .longName("recursive")
+            .shortName('r')
+            .description("apply operation to closure of the specified paths")
+            .set(&this->recursive, true);
+
     mkFlag(0, "all", "apply operation to the entire store", &all);
 }
 

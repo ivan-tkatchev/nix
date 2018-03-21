@@ -19,7 +19,7 @@ namespace nix {
 /* Nix store and database schema version.  Version 1 (or 0) was Nix <=
    0.7.  Version 2 was Nix 0.8 and 0.9.  Version 3 is Nix 0.10.
    Version 4 is Nix 0.11.  Version 5 is Nix 0.12-0.16.  Version 6 is
-   Nix 1.0.  Version 7 is Nix 1.3. Version 10 is 1.12. */
+   Nix 1.0.  Version 7 is Nix 1.3. Version 10 is 2.0. */
 const int nixSchemaVersion = 10;
 
 
@@ -97,12 +97,15 @@ public:
 private:
 
     Setting<bool> requireSigs{(Store*) this,
-        settings.signedBinaryCaches != "", // FIXME
+        settings.requireSigs,
         "require-sigs", "whether store paths should have a trusted signature on import"};
 
     PublicKeys publicKeys;
 
 public:
+
+    // Hack for build-remote.cc.
+    PathSet locksHeld = tokenizeString<PathSet>(getEnv("NIX_HELD_LOCKS"));
 
     /* Initialise the local store, upgrading the schema if
        necessary. */
@@ -140,7 +143,7 @@ public:
     void querySubstitutablePathInfos(const PathSet & paths,
         SubstitutablePathInfos & infos) override;
 
-    void addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
+    void addToStore(const ValidPathInfo & info, Source & source,
         RepairFlag repair, CheckSigsFlag checkSigs,
         std::shared_ptr<FSAccessor> accessor) override;
 

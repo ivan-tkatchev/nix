@@ -411,7 +411,7 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
             /* Repairing is not atomic, so disallowed for "untrusted"
                clients.  */
             if (mode == bmRepair && !trusted)
-                throw Error("repairing is not supported when building through the Nix daemon");
+                throw Error("repairing is not allowed because you are not in 'trusted-users'");
         }
         logger->startWork();
         store->buildPaths(drvs, mode);
@@ -509,7 +509,7 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
         verbosity = (Verbosity) readInt(from);
         settings.maxBuildJobs.assign(readInt(from));
         settings.maxSilentTime = readInt(from);
-        settings.useBuildHook = readInt(from) != 0;
+        readInt(from); // obsolete useBuildHook
         settings.verboseBuild = lvlError == (Verbosity) readInt(from);
         readInt(from); // obsolete logType
         readInt(from); // obsolete printBuildTrace
@@ -695,7 +695,7 @@ static void performOp(TunnelLogger * logger, ref<LocalStore> store,
         parseDump(tee, tee.source);
 
         logger->startWork();
-        store->addToStore(info, tee.source.data, (RepairFlag) repair,
+        store.cast<Store>()->addToStore(info, tee.source.data, (RepairFlag) repair,
             dontCheckSigs ? NoCheckSigs : CheckSigs, nullptr);
         logger->stopWork();
         break;
@@ -816,8 +816,11 @@ static void processConnection(bool trusted)
 
 static void sigChldHandler(int sigNo)
 {
+    // Ensure we don't modify errno of whatever we've interrupted
+    auto saved_errno = errno;
     /* Reap all dead children. */
     while (waitpid(-1, 0, WNOHANG) > 0) ;
+    errno = saved_errno;
 }
 
 
@@ -994,7 +997,7 @@ static void daemonLoop(char * * argv)
             if (matchUser(user, group, trustedUsers))
                 trusted = true;
 
-            if (!trusted && !matchUser(user, group, allowedUsers))
+            if ((!trusted && !matchUser(user, group, allowedUsers)) || group == settings.buildUsersGroup)
                 throw Error(format("user '%1%' is not allowed to connect to the Nix daemon") % user);
 
             printInfo(format((string) "accepted connection from pid %1%, user %2%" + (trusted ? " (trusted)" : ""))
@@ -1059,6 +1062,8 @@ int main(int argc, char * * argv)
             else return false;
             return true;
         });
+
+        initPlugins();
 
         if (stdio) {
             if (getStoreType() == tDaemon) {

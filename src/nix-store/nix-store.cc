@@ -122,7 +122,6 @@ static void opRealise(Strings opFlags, Strings opArgs)
         if (i == "--dry-run") dryRun = true;
         else if (i == "--repair") buildMode = bmRepair;
         else if (i == "--check") buildMode = bmCheck;
-        else if (i == "--hash") buildMode = bmHash;
         else if (i == "--ignore-unknown") ignoreUnknown = true;
         else throw UsageError(format("unknown flag '%1%'") % i);
 
@@ -440,15 +439,6 @@ static void opQuery(Strings opFlags, Strings opArgs)
 }
 
 
-static string shellEscape(const string & s)
-{
-    string r;
-    for (auto & i : s)
-        if (i == '\'') r += "'\\''"; else r += i;
-    return r;
-}
-
-
 static void opPrintEnv(Strings opFlags, Strings opArgs)
 {
     if (!opFlags.empty()) throw UsageError("unknown flag");
@@ -460,7 +450,7 @@ static void opPrintEnv(Strings opFlags, Strings opArgs)
     /* Print each environment variable in the derivation in a format
        that can be sourced by the shell. */
     for (auto & i : drv.env)
-        cout << format("export %1%; %1%='%2%'\n") % i.first % shellEscape(i.second);
+        cout << format("export %1%; %1%=%2%\n") % i.first % shellEscape(i.second);
 
     /* Also output the arguments.  This doesn't preserve whitespace in
        arguments. */
@@ -641,6 +631,7 @@ static void opDump(Strings opFlags, Strings opArgs)
     FdSink sink(STDOUT_FILENO);
     string path = *opArgs.begin();
     dumpPath(path, sink);
+    sink.flush();
 }
 
 
@@ -666,6 +657,7 @@ static void opExport(Strings opFlags, Strings opArgs)
 
     FdSink sink(STDOUT_FILENO);
     store->exportPaths(opArgs, sink);
+    sink.flush();
 }
 
 
@@ -1061,6 +1053,8 @@ int main(int argc, char * * argv)
 
             return true;
         });
+
+        initPlugins();
 
         if (!op) throw UsageError("no operation specified");
 

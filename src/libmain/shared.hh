@@ -2,6 +2,7 @@
 
 #include "util.hh"
 #include "args.hh"
+#include "common-args.hh"
 
 #include <signal.h>
 
@@ -16,10 +17,12 @@ public:
     int status;
     Exit() : status(0) { }
     Exit(int status) : status(status) { }
+    virtual ~Exit();
 };
 
 int handleExceptions(const string & programName, std::function<void()> fun);
 
+/* Don't forget to call initPlugins() after settings are initialized! */
 void initNix();
 
 void parseCmdLine(int argc, char * * argv,
@@ -67,6 +70,19 @@ template<class N> N getIntArg(const string & opt,
         throw UsageError(format("'%1%' requires an integer argument") % opt);
     return n * multiplier;
 }
+
+
+struct LegacyArgs : public MixCommonArgs
+{
+    std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg;
+
+    LegacyArgs(const std::string & programName,
+        std::function<bool(Strings::iterator & arg, const Strings::iterator & end)> parseArg);
+
+    bool processFlag(Strings::iterator & pos, Strings::iterator end) override;
+
+    bool processArgs(const Strings & args, bool finish) override;
+};
 
 
 /* Show the manual page for the specified program. */

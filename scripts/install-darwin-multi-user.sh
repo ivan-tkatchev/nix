@@ -24,7 +24,7 @@ readonly YELLOW='\033[38;33m'
 readonly YELLOW_UL='\033[38;4;33m'
 
 readonly CORES=$(sysctl -n hw.ncpu)
-readonly NIX_USER_COUNT="$CORES"
+readonly NIX_USER_COUNT="32"
 readonly NIX_BUILD_GROUP_ID="30000"
 readonly NIX_BUILD_GROUP_NAME="nixbld"
 readonly NIX_FIRST_BUILD_UID="30001"
@@ -33,7 +33,7 @@ readonly NIX_FIRST_BUILD_UID="30001"
 readonly NIX_ROOT="/nix"
 readonly PLIST_DEST=/Library/LaunchDaemons/org.nixos.nix-daemon.plist
 
-readonly PROFILE_TARGETS=("/etc/profile" "/etc/bashrc" "/etc/zshrc")
+readonly PROFILE_TARGETS=("/etc/bashrc" "/etc/zshrc")
 readonly PROFILE_BACKUP_SUFFIX=".backup-before-nix"
 readonly PROFILE_NIX_FILE="$NIX_ROOT/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
 
@@ -153,7 +153,7 @@ subheader() {
 }
 
 row() {
-    printf "$BOLD%s$ESC:\t%s\n" "$1" "$2"
+    printf "$BOLD%s$ESC:\\t%s\\n" "$1" "$2"
 }
 
 task() {
@@ -218,7 +218,7 @@ __sudo() {
 
     echo "I am executing:"
     echo ""
-    printf "    $ sudo %s\n" "$cmd"
+    printf "    $ sudo %s\\n" "$cmd"
     echo ""
     echo "$expl"
     echo ""
@@ -264,7 +264,7 @@ them and open them again. Other than that, you should be ready to go.
 
 Try it! Open a new terminal, and type:
 
-  $ nix-shell -p figlet -p lolcat --run "echo 'nix rules' | figlet | lolcat"
+  $ nix-shell -p nix-info --run "nix-info -m"
 
 Thank you for using this installer. If you have any feedback, don't
 hesitate:
@@ -318,7 +318,7 @@ EOF
 
     for file in ~/.bash_profile ~/.bash_login ~/.profile ~/.zshenv ~/.zprofile ~/.zshrc ~/.zlogin; do
         if [ -f "$file" ]; then
-            if grep -l ".nix-profile" "$file"; then
+            if grep -l "^[^#].*.nix-profile" "$file"; then
                 failure <<EOF
 I found a reference to a ".nix-profile" in $file.
 This has a high chance of breaking a new nix installation. It was most
@@ -473,10 +473,8 @@ create_build_user_for_core() {
 
     if ! /usr/bin/dscl . -read "$dsclpath" > /dev/null 2>&1; then
         _sudo "Creating the Nix build user, $username" \
-              /usr/sbin/sysadminctl -addUser -fullName "Nix build user $coreid" \
-	      -home /var/empty \
-	      -UID "${uid}" \
-              -addUser "${username}"
+              /usr/bin/dscl . create "$dsclpath" \
+              UniqueID "${uid}"
         row "           Created" "Yes"
     else
         actual_uid=$(dsclattr "$dsclpath" "UniqueID")
@@ -504,6 +502,22 @@ EOF
         row "          IsHidden" "Yes"
     fi
 
+    if [ "$(dsclattr "$dsclpath" "NFSHomeDirectory")" = "/var/empty" ]; then
+        row "          NFSHomeDirectory" "/var/empty"
+    else
+        _sudo "in order to give $username a safe home directory" \
+              /usr/bin/dscl . -create "$dsclpath" "NFSHomeDirectory" "/var/empty"
+        row "          NFSHomeDirectory" "/var/empty"
+    fi
+
+    if [ "$(dsclattr "$dsclpath" "RealName")" = "Nix build user $coreid" ]; then
+        row "          RealName" "Nix build user $coreid"
+    else
+        _sudo "in order to give $username a useful name" \
+              /usr/bin/dscl . -create "$dsclpath" "RealName" "Nix build user $coreid"
+        row "          RealName" "Nix build user $coreid"
+    fi
+
     if [ "$(dsclattr "$dsclpath" "UserShell")" = "/sbin/nologin" ]; then
         row "   Logins Disabled" "Yes"
     else
@@ -521,11 +535,11 @@ EOF
         row "  Member of $NIX_BUILD_GROUP_NAME" "Yes"
     fi
 
-    if [ "$(dsclattr "$dsclpath" "PrimaryGroupId")" = "$NIX_BUILD_GROUP_ID" ]; then
+    if [ "$(dsclattr "$dsclpath" "PrimaryGroupID")" = "$NIX_BUILD_GROUP_ID" ]; then
         row "    PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
     else
         _sudo "to let the nix daemon use this user for builds (this might seem redundant, but there are two concepts of group membership)" \
-              /usr/bin/dscl . -create "$dsclpath" "PrimaryGroupId" "$NIX_BUILD_GROUP_ID"
+              /usr/bin/dscl . -create "$dsclpath" "PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
         row "    PrimaryGroupID" "$NIX_BUILD_GROUP_ID"
 
     fi
@@ -633,7 +647,7 @@ chat_about_sudo() {
         cat <<EOF
 This script is going to call sudo a lot. Normally, it would show you
 exactly what commands it is running and why. However, the script is
-run in  a headless fashion, like this:
+run in a headless fashion, like this:
 
   $ curl https://nixos.org/nix/install | sh
 
@@ -681,7 +695,7 @@ install_from_extracted_nix() {
         cd "$EXTRACTED_NIX_PATH"
 
         _sudo "to copy the basic Nix files to the new store at $NIX_ROOT/store" \
-              rsync -rlpt "$(pwd)/store/" "$NIX_ROOT/store/"
+              rsync -rlpt ./store/* "$NIX_ROOT/store/"
 
         if [ -d "$NIX_INSTALLED_NIX" ]; then
             echo "      Alright! We have our first nix at $NIX_INSTALLED_NIX"
@@ -730,13 +744,13 @@ configure_shell_profile() {
 
 setup_default_profile() {
     _sudo "to installing a bootstrapping Nix in to the default Profile" \
-          -i "$NIX_INSTALLED_NIX/bin/nix-env" -i "$NIX_INSTALLED_NIX"
+          HOME=$ROOT_HOME "$NIX_INSTALLED_NIX/bin/nix-env" -i "$NIX_INSTALLED_NIX"
 
     _sudo "to installing a bootstrapping SSL certificate just for Nix in to the default Profile" \
-          -i "$NIX_INSTALLED_NIX/bin/nix-env" -i "$NIX_INSTALLED_CACERT"
+          HOME=$ROOT_HOME "$NIX_INSTALLED_NIX/bin/nix-env" -i "$NIX_INSTALLED_CACERT"
 
     _sudo "to update the default channel in the default profile" \
-          -i NIX_SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt "$NIX_INSTALLED_NIX/bin/nix-channel" --update nixpkgs
+          HOME=$ROOT_HOME NIX_SSL_CERT_FILE=/nix/var/nix/profiles/default/etc/ssl/certs/ca-bundle.crt "$NIX_INSTALLED_NIX/bin/nix-channel" --update nixpkgs
 }
 
 
@@ -747,14 +761,6 @@ build-users-group = $NIX_BUILD_GROUP_NAME
 max-jobs = $NIX_USER_COUNT
 cores = 1
 sandbox = false
-
-binary-caches = https://cache.nixos.org/
-trusted-binary-caches =
-binary-cache-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
-signed-binary-caches = *
-
-trusted-users = root
-allowed-users = *
 EOF
     _sudo "to place the default nix daemon configuration (part 2)" \
           install -m 0664 "$SCRATCH/nix.conf" /etc/nix/nix.conf

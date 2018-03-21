@@ -16,6 +16,7 @@
 #include "serialise.hh"
 #include "store-api.hh"
 #include "derivations.hh"
+#include "local-store.hh"
 
 using namespace nix;
 using std::cin;
@@ -41,24 +42,35 @@ int main (int argc, char * * argv)
     return handleExceptions(argv[0], [&]() {
         initNix();
 
+        logger = makeJSONLogger(*logger);
+
         /* Ensure we don't get any SSH passphrase or host key popups. */
         unsetenv("DISPLAY");
         unsetenv("SSH_ASKPASS");
 
-        if (argc != 6)
+        if (argc != 2)
             throw UsageError("called without required arguments");
 
-        auto store = openStore();
+        verbosity = (Verbosity) std::stoll(argv[1]);
 
-        auto localSystem = argv[1];
-        settings.maxSilentTime = std::stoll(argv[2]);
-        settings.buildTimeout = std::stoll(argv[3]);
-        verbosity = (Verbosity) std::stoll(argv[4]);
-        settings.builders = argv[5];
+        FdSource source(STDIN_FILENO);
+
+        /* Read the parent's settings. */
+        while (readInt(source)) {
+            auto name = readString(source);
+            auto value = readString(source);
+            settings.set(name, value);
+        }
+
+        settings.maxBuildJobs.set("1"); // hack to make tests with local?root= work
+
+        initPlugins();
+
+        auto store = openStore().cast<LocalStore>();
 
         /* It would be more appropriate to use $XDG_RUNTIME_DIR, since
            that gets cleared on reboot, but it wouldn't work on macOS. */
-        currentLoad = settings.nixStateDir + "/current-load";
+        currentLoad = store->stateDir + "/current-load";
 
         std::shared_ptr<Store> sshStore;
         AutoCloseFD bestSlotLock;
@@ -73,18 +85,20 @@ int main (int argc, char * * argv)
 
         string drvPath;
         string storeUri;
-        for (string line; getline(cin, line);) {
-            auto tokens = tokenizeString<std::vector<string>>(line);
-            auto sz = tokens.size();
-            if (sz != 3 && sz != 4)
-                throw Error("invalid build hook line '%1%'", line);
-            auto amWilling = tokens[0] == "1";
-            auto neededSystem = tokens[1];
-            drvPath = tokens[2];
-            auto requiredFeatures = sz == 3 ?
-                std::set<string>{} :
-                tokenizeString<std::set<string>>(tokens[3], ",");
-            auto canBuildLocally = amWilling && (neededSystem == localSystem);
+
+        while (true) {
+
+            try {
+                auto s = readString(source);
+                if (s != "try") return;
+            } catch (EndOfFile &) { return; }
+
+            auto amWilling = readInt(source);
+            auto neededSystem = readString(source);
+            source >> drvPath;
+            auto requiredFeatures = readStrings<std::set<std::string>>(source);
+
+            auto canBuildLocally = amWilling && (neededSystem == settings.thisSystem);
 
             /* Error ignored here, will be caught later */
             mkdir(currentLoad.c_str(), 0777);
@@ -99,7 +113,7 @@ int main (int argc, char * * argv)
                 Machine * bestMachine = nullptr;
                 unsigned long long bestLoad = 0;
                 for (auto & m : machines) {
-                    debug("considering building on '%s'", m.storeUri);
+                    debug("considering building on remote machine '%s'", m.storeUri);
 
                     if (m.enabled && std::find(m.systemTypes.begin(),
                             m.systemTypes.end(),
@@ -162,17 +176,25 @@ int main (int argc, char * * argv)
 
                 try {
 
-                    Store::Params storeParams{{"max-connections", "1"}, {"log-fd", "4"}};
-                    if (bestMachine->sshKey != "")
-                        storeParams["ssh-key"] = bestMachine->sshKey;
+                    Activity act(*logger, lvlTalkative, actUnknown, fmt("connecting to '%s'", bestMachine->storeUri));
+
+                    Store::Params storeParams;
+                    if (hasPrefix(bestMachine->storeUri, "ssh://")) {
+                        storeParams["max-connections"] ="1";
+                        storeParams["log-fd"] = "4";
+                        if (bestMachine->sshKey != "")
+                            storeParams["ssh-key"] = bestMachine->sshKey;
+                    }
 
                     sshStore = openStore(bestMachine->storeUri, storeParams);
                     sshStore->connect();
                     storeUri = bestMachine->storeUri;
 
                 } catch (std::exception & e) {
-                    printError("unable to open SSH connection to '%s': %s; trying other available machines...",
-                        bestMachine->storeUri, e.what());
+                    auto msg = chomp(drainFD(5, false));
+                    printError("cannot build on '%s': %s%s",
+                        bestMachine->storeUri, e.what(),
+                        (msg.empty() ? "" : ": " + msg));
                     bestMachine->enabled = false;
                     continue;
                 }
@@ -182,32 +204,38 @@ int main (int argc, char * * argv)
         }
 
 connected:
-        std::cerr << "# accept\n";
-        string line;
-        if (!getline(cin, line))
-            throw Error("hook caller didn't send inputs");
+        close(5);
 
-        auto inputs = tokenizeString<PathSet>(line);
-        if (!getline(cin, line))
-            throw Error("hook caller didn't send outputs");
+        std::cerr << "# accept\n" << storeUri << "\n";
 
-        auto outputs = tokenizeString<PathSet>(line);
+        auto inputs = readStrings<PathSet>(source);
+        auto outputs = readStrings<PathSet>(source);
 
         AutoCloseFD uploadLock = openLockFile(currentLoad + "/" + escapeUri(storeUri) + ".upload-lock", true);
 
-        auto old = signal(SIGALRM, handleAlarm);
-        alarm(15 * 60);
-        if (!lockFile(uploadLock.get(), ltWrite, true))
-            printError("somebody is hogging the upload lock for '%s', continuing...");
-        alarm(0);
-        signal(SIGALRM, old);
-        copyPaths(store, ref<Store>(sshStore), inputs, NoRepair, NoCheckSigs);
+        {
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("waiting for the upload lock to '%s'", storeUri));
+
+            auto old = signal(SIGALRM, handleAlarm);
+            alarm(15 * 60);
+            if (!lockFile(uploadLock.get(), ltWrite, true))
+                printError("somebody is hogging the upload lock for '%s', continuing...");
+            alarm(0);
+            signal(SIGALRM, old);
+        }
+
+        auto substitute = settings.buildersUseSubstitutes ? Substitute : NoSubstitute;
+
+        {
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
+            copyPaths(store, ref<Store>(sshStore), inputs, NoRepair, NoCheckSigs, substitute);
+        }
+
         uploadLock = -1;
 
-        BasicDerivation drv(readDerivation(drvPath));
+        BasicDerivation drv(readDerivation(store->realStoreDir + "/" + baseNameOf(drvPath)));
         drv.inputSrcs = inputs;
 
-        printError("building '%s' on '%s'", drvPath, storeUri);
         auto result = sshStore->buildDerivation(drvPath, drv);
 
         if (!result.success())
@@ -218,8 +246,9 @@ connected:
             if (!store->isValidPath(path)) missing.insert(path);
 
         if (!missing.empty()) {
-            setenv("NIX_HELD_LOCKS", concatStringsSep(" ", missing).c_str(), 1); /* FIXME: ugly */
-            copyPaths(ref<Store>(sshStore), store, missing, NoRepair, NoCheckSigs);
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying outputs from '%s'", storeUri));
+            store->locksHeld.insert(missing.begin(), missing.end()); /* FIXME: ugly */
+            copyPaths(ref<Store>(sshStore), store, missing, NoRepair, NoCheckSigs, NoSubstitute);
         }
 
         return;

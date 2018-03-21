@@ -13,9 +13,6 @@ perl/Makefile.config
 
 /corepkgs/config.nix
 
-# /corepkgs/buildenv/
-/corepkgs/buildenv/builder.pl
-
 # /corepkgs/channels/
 /corepkgs/channels/unpack.sh
 
@@ -38,6 +35,7 @@ perl/Makefile.config
 /scripts/nix-copy-closure
 /scripts/nix-reduce-build
 /scripts/nix-http-export.cgi
+/scripts/nix-profile-daemon.sh
 
 # /src/libexpr/
 /src/libexpr/lexer-tab.cc
@@ -71,9 +69,6 @@ perl/Makefile.config
 # /src/nix-channel/
 /src/nix-channel/nix-channel
 
-# /src/buildenv/
-/src/buildenv/buildenv
-
 # /src/nix-build/
 /src/nix-build/nix-build
 
@@ -99,16 +94,20 @@ perl/Makefile.config
 /misc/systemd/nix-daemon.socket
 /misc/upstart/nix-daemon.conf
 
+/src/resolve-system-dependencies/resolve-system-dependencies
+
 inst/
 
 *.a
 *.o
 *.so
+*.dylib
 *.dll
 *.exe
 *.dep
 *~
 *.pc
+*.plist
 
 # GNU Global
 GPATH

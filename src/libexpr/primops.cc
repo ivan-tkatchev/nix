@@ -39,7 +39,7 @@ std::pair<string, string> decodeContext(const string & s)
         size_t index = s.find("!", 1);
         return std::pair<string, string>(string(s, index + 1), string(s, 1, index - 1));
     } else
-        return std::pair<string, string>(s.at(0) == '/' ? s: string(s, 1), "");
+        return std::pair<string, string>(s.at(0) == '/' ? s : string(s, 1), "");
 }
 
 
@@ -49,24 +49,38 @@ InvalidPathError::InvalidPathError(const Path & path) :
 void EvalState::realiseContext(const PathSet & context)
 {
     PathSet drvs;
+
     for (auto & i : context) {
         std::pair<string, string> decoded = decodeContext(i);
         Path ctx = decoded.first;
         assert(store->isStorePath(ctx));
         if (!store->isValidPath(ctx))
             throw InvalidPathError(ctx);
-        if (!decoded.second.empty() && nix::isDerivation(ctx))
+        if (!decoded.second.empty() && nix::isDerivation(ctx)) {
             drvs.insert(decoded.first + "!" + decoded.second);
+
+            /* Add the output of this derivation to the allowed
+               paths. */
+            if (allowedPaths) {
+                auto drv = store->derivationFromPath(decoded.first);
+                DerivationOutputs::iterator i = drv.outputs.find(decoded.second);
+                if (i == drv.outputs.end())
+                    throw Error("derivation '%s' does not have an output named '%s'", decoded.first, decoded.second);
+                allowedPaths->insert(i->second.path);
+            }
+        }
     }
-    if (!drvs.empty()) {
-        if (!settings.enableImportFromDerivation)
-            throw EvalError(format("attempted to realize '%1%' during evaluation but 'allow-import-from-derivation' is false") % *(drvs.begin()));
-        /* For performance, prefetch all substitute info. */
-        PathSet willBuild, willSubstitute, unknown;
-        unsigned long long downloadSize, narSize;
-        store->queryMissing(drvs, willBuild, willSubstitute, unknown, downloadSize, narSize);
-        store->buildPaths(drvs);
-    }
+
+    if (drvs.empty()) return;
+
+    if (!settings.enableImportFromDerivation)
+        throw EvalError(format("attempted to realize '%1%' during evaluation but 'allow-import-from-derivation' is false") % *(drvs.begin()));
+
+    /* For performance, prefetch all substitute info. */
+    PathSet willBuild, willSubstitute, unknown;
+    unsigned long long downloadSize, narSize;
+    store->queryMissing(drvs, willBuild, willSubstitute, unknown, downloadSize, narSize);
+    store->buildPaths(drvs);
 }
 
 
@@ -84,10 +98,10 @@ static void prim_scopedImport(EvalState & state, const Pos & pos, Value * * args
             % path % e.path % pos);
     }
 
-    path = state.checkSourcePath(path);
+    Path realPath = state.checkSourcePath(state.toRealPath(path, context));
 
     if (state.store->isStorePath(path) && state.store->isValidPath(path) && isDerivation(path)) {
-        Derivation drv = readDerivation(path);
+        Derivation drv = readDerivation(realPath);
         Value & w = *state.allocValue();
         state.mkAttrs(w, 3 + drv.outputs.size());
         Value * v2 = state.allocAttr(w, state.sDrvPath);
@@ -114,7 +128,7 @@ static void prim_scopedImport(EvalState & state, const Pos & pos, Value * * args
     } else {
         state.forceAttrs(*args[0]);
         if (args[0]->attrs->empty())
-            state.evalFile(path, v);
+            state.evalFile(realPath, v);
         else {
             Env * env = &state.allocEnv(args[0]->attrs->size());
             env->up = &state.baseEnv;
@@ -127,8 +141,8 @@ static void prim_scopedImport(EvalState & state, const Pos & pos, Value * * args
                 env->values[displ++] = attr.value;
             }
 
-            printTalkative("evaluating file '%1%'", path);
-            Expr * e = state.parseExprFromFile(resolveExprPath(path), staticEnv);
+            printTalkative("evaluating file '%1%'", realPath);
+            Expr * e = state.parseExprFromFile(resolveExprPath(realPath), staticEnv);
 
             e->eval(state, *env, v);
         }
@@ -439,7 +453,7 @@ static void prim_tryEval(EvalState & state, const Pos & pos, Value * * args, Val
 static void prim_getEnv(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
     string name = state.forceStringNoCtx(*args[0], pos);
-    mkString(v, state.restricted ? "" : getEnv(name));
+    mkString(v, settings.restrictEval || settings.pureEval ? "" : getEnv(name));
 }
 
 
@@ -539,7 +553,7 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
 
     for (auto & i : args[0]->attrs->lexicographicOrder()) {
         if (i->name == state.sIgnoreNulls) continue;
-        string key = i->name;
+        const string & key = i->name;
         vomit("processing attribute '%1%'", key);
 
         auto handleHashMode = [&](const std::string & s) {
@@ -575,7 +589,7 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
 
             /* The `args' attribute is special: it supplies the
                command-line arguments to the builder. */
-            if (key == "args") {
+            if (i->name == state.sArgs) {
                 state.forceList(*i->value, pos);
                 for (unsigned int n = 0; n < i->value->listSize(); ++n) {
                     string s = state.coerceToString(posDrvName, *i->value->listElems()[n], context, true);
@@ -598,15 +612,13 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
                         drv.builder = state.forceString(*i->value, context, posDrvName);
                     else if (i->name == state.sSystem)
                         drv.platform = state.forceStringNoCtx(*i->value, posDrvName);
-                    else if (i->name == state.sName)
-                        drvName = state.forceStringNoCtx(*i->value, posDrvName);
-                    else if (key == "outputHash")
+                    else if (i->name == state.sOutputHash)
                         outputHash = state.forceStringNoCtx(*i->value, posDrvName);
-                    else if (key == "outputHashAlgo")
+                    else if (i->name == state.sOutputHashAlgo)
                         outputHashAlgo = state.forceStringNoCtx(*i->value, posDrvName);
-                    else if (key == "outputHashMode")
+                    else if (i->name == state.sOutputHashMode)
                         handleHashMode(state.forceStringNoCtx(*i->value, posDrvName));
-                    else if (key == "outputs") {
+                    else if (i->name == state.sOutputs) {
                         /* Require ‘outputs’ to be a list of strings. */
                         state.forceList(*i->value, posDrvName);
                         Strings ss;
@@ -620,14 +632,10 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
                     drv.env.emplace(key, s);
                     if (i->name == state.sBuilder) drv.builder = s;
                     else if (i->name == state.sSystem) drv.platform = s;
-                    else if (i->name == state.sName) {
-                        drvName = s;
-                        printMsg(lvlVomit, format("derivation name is '%1%'") % drvName);
-                    }
-                    else if (key == "outputHash") outputHash = s;
-                    else if (key == "outputHashAlgo") outputHashAlgo = s;
-                    else if (key == "outputHashMode") handleHashMode(s);
-                    else if (key == "outputs")
+                    else if (i->name == state.sOutputHash) outputHash = s;
+                    else if (i->name == state.sOutputHashAlgo) outputHashAlgo = s;
+                    else if (i->name == state.sOutputHashMode) handleHashMode(s);
+                    else if (i->name == state.sOutputs)
                         handleOutputs(tokenizeString<Strings>(s));
                 }
 
@@ -713,7 +721,7 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
         if (outputHashRecursive) outputHashAlgo = "r:" + outputHashAlgo;
 
         Path outPath = state.store->makeFixedOutputPath(outputHashRecursive, h, drvName);
-        drv.env["out"] = outPath;
+        if (!jsonObject) drv.env["out"] = outPath;
         drv.outputs["out"] = DerivationOutput(outPath, outputHashAlgo, *outputHash);
     }
 
@@ -724,7 +732,7 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
            an empty value.  This ensures that changes in the set of
            output names do get reflected in the hash. */
         for (auto & i : outputs) {
-            drv.env[i] = "";
+            if (!jsonObject) drv.env[i] = "";
             drv.outputs[i] = DerivationOutput("", "", "");
         }
 
@@ -735,7 +743,7 @@ static void prim_derivationStrict(EvalState & state, const Pos & pos, Value * * 
         for (auto & i : drv.outputs)
             if (i.second.path == "") {
                 Path outPath = state.store->makeOutputPath(i.first, h, drvName);
-                drv.env[i.first] = outPath;
+                if (!jsonObject) drv.env[i.first] = outPath;
                 i.second.path = outPath;
             }
     }
@@ -863,7 +871,7 @@ static void prim_readFile(EvalState & state, const Pos & pos, Value * * args, Va
         throw EvalError(format("cannot read '%1%', since path '%2%' is not valid, at %3%")
             % path % e.path % pos);
     }
-    string s = readFile(state.checkSourcePath(path));
+    string s = readFile(state.checkSourcePath(state.toRealPath(path, context)));
     if (s.find((char) 0) != string::npos)
         throw Error(format("the contents of the file '%1%' cannot be represented as a Nix string") % path);
     mkString(v, s.c_str());
@@ -1009,22 +1017,14 @@ static void prim_toFile(EvalState & state, const Pos & pos, Value * * args, Valu
 }
 
 
-struct FilterFromExpr : PathFilter
+static void addPath(EvalState & state, const Pos & pos, const string & name, const Path & path_,
+    Value * filterFun, bool recursive, const Hash & expectedHash, Value & v)
 {
-    EvalState & state;
-    Value & filter;
-    Pos pos;
-
-    FilterFromExpr(EvalState & state, Value & filter, const Pos & pos)
-        : state(state), filter(filter), pos(pos)
-    {
-    }
-
-    bool operator () (const Path & path)
-    {
-        struct stat st;
-        if (lstat(path.c_str(), &st))
-            throw SysError(format("getting attributes of path '%1%'") % path);
+    const auto path = settings.pureEval && expectedHash ?
+        path_ :
+        state.checkSourcePath(path_);
+    PathFilter filter = filterFun ? ([&](const Path & path) {
+        auto st = lstat(path);
 
         /* Call the filter function.  The first argument is the path,
            the second is a string indicating the type of the file. */
@@ -1032,7 +1032,7 @@ struct FilterFromExpr : PathFilter
         mkString(arg1, path);
 
         Value fun2;
-        state.callFunction(filter, arg1, fun2, noPos);
+        state.callFunction(*filterFun, arg1, fun2, noPos);
 
         Value arg2;
         mkString(arg2,
@@ -1045,8 +1045,26 @@ struct FilterFromExpr : PathFilter
         state.callFunction(fun2, arg2, res, noPos);
 
         return state.forceBool(res, pos);
+    }) : defaultPathFilter;
+
+    Path expectedStorePath;
+    if (expectedHash) {
+        expectedStorePath =
+            state.store->makeFixedOutputPath(recursive, expectedHash, name);
     }
-};
+    Path dstPath;
+    if (!expectedHash || !state.store->isValidPath(expectedStorePath)) {
+        dstPath = settings.readOnlyMode
+            ? state.store->computeStorePathForPath(name, path, recursive, htSHA256, filter).first
+            : state.store->addToStore(name, path, recursive, htSHA256, filter, state.repair);
+        if (expectedHash && expectedStorePath != dstPath) {
+            throw Error(format("store path mismatch in (possibly filtered) path added from '%1%'") % path);
+        }
+    } else
+        dstPath = expectedStorePath;
+
+    mkString(v, dstPath, {dstPath});
+}
 
 
 static void prim_filterSource(EvalState & state, const Pos & pos, Value * * args, Value & v)
@@ -1060,15 +1078,43 @@ static void prim_filterSource(EvalState & state, const Pos & pos, Value * * args
     if (args[0]->type != tLambda)
         throw TypeError(format("first argument in call to 'filterSource' is not a function but %1%, at %2%") % showType(*args[0]) % pos);
 
-    FilterFromExpr filter(state, *args[0], pos);
+    addPath(state, pos, baseNameOf(path), path, args[0], true, Hash(), v);
+}
 
-    path = state.checkSourcePath(path);
+static void prim_path(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    state.forceAttrs(*args[0], pos);
+    Path path;
+    string name;
+    Value * filterFun = nullptr;
+    auto recursive = true;
+    Hash expectedHash;
 
-    Path dstPath = settings.readOnlyMode
-        ? state.store->computeStorePathForPath(path, true, htSHA256, filter).first
-        : state.store->addToStore(baseNameOf(path), path, true, htSHA256, filter, state.repair);
+    for (auto & attr : *args[0]->attrs) {
+        const string & n(attr.name);
+        if (n == "path") {
+            PathSet context;
+            path = state.coerceToPath(*attr.pos, *attr.value, context);
+            if (!context.empty())
+                throw EvalError(format("string '%1%' cannot refer to other paths, at %2%") % path % *attr.pos);
+        } else if (attr.name == state.sName)
+            name = state.forceStringNoCtx(*attr.value, *attr.pos);
+        else if (n == "filter") {
+            state.forceValue(*attr.value);
+            filterFun = attr.value;
+        } else if (n == "recursive")
+            recursive = state.forceBool(*attr.value, *attr.pos);
+        else if (n == "sha256")
+            expectedHash = Hash(state.forceStringNoCtx(*attr.value, *attr.pos), htSHA256);
+        else
+            throw EvalError(format("unsupported argument '%1%' to 'addPath', at %2%") % attr.name % *attr.pos);
+    }
+    if (path.empty())
+        throw EvalError(format("'path' required, at %1%") % pos);
+    if (name.empty())
+        name = baseNameOf(path);
 
-    mkString(v, dstPath, {dstPath});
+    addPath(state, pos, name, path, filterFun, recursive, expectedHash, v);
 }
 
 
@@ -1086,8 +1132,11 @@ static void prim_attrNames(EvalState & state, const Pos & pos, Value * * args, V
     state.mkList(v, args[0]->attrs->size());
 
     size_t n = 0;
-    for (auto & i : args[0]->attrs->lexicographicOrder())
-        mkString(*(v.listElems()[n++] = state.allocValue()), i->name);
+    for (auto & i : *args[0]->attrs)
+        mkString(*(v.listElems()[n++] = state.allocValue()), i.name);
+
+    std::sort(v.listElems(), v.listElems() + n,
+              [](Value * v1, Value * v2) { return strcmp(v1->string.s, v2->string.s) < 0; });
 }
 
 
@@ -1552,12 +1601,16 @@ static void prim_partition(EvalState & state, const Pos & pos, Value * * args, V
     state.mkAttrs(v, 2);
 
     Value * vRight = state.allocAttr(v, state.sRight);
-    state.mkList(*vRight, right.size());
-    memcpy(vRight->listElems(), right.data(), sizeof(Value *) * right.size());
+    auto rsize = right.size();
+    state.mkList(*vRight, rsize);
+    if (rsize)
+        memcpy(vRight->listElems(), right.data(), sizeof(Value *) * rsize);
 
     Value * vWrong = state.allocAttr(v, state.sWrong);
-    state.mkList(*vWrong, wrong.size());
-    memcpy(vWrong->listElems(), wrong.data(), sizeof(Value *) * wrong.size());
+    auto wsize = wrong.size();
+    state.mkList(*vWrong, wsize);
+    if (wsize)
+        memcpy(vWrong->listElems(), wrong.data(), sizeof(Value *) * wsize);
 
     v.attrs->sort();
 }
@@ -1668,6 +1721,14 @@ static void prim_unsafeDiscardStringContext(EvalState & state, const Pos & pos, 
     PathSet context;
     string s = state.coerceToString(pos, *args[0], context);
     mkString(v, s, PathSet());
+}
+
+
+static void prim_hasContext(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    PathSet context;
+    state.forceString(*args[0], context, pos);
+    mkBool(v, !context.empty());
 }
 
 
@@ -1856,21 +1917,32 @@ static void prim_replaceStrings(EvalState & state, const Pos & pos, Value * * ar
     auto s = state.forceString(*args[2], context, pos);
 
     string res;
-    for (size_t p = 0; p < s.size(); ) {
+    // Loops one past last character to handle the case where 'from' contains an empty string.
+    for (size_t p = 0; p <= s.size(); ) {
         bool found = false;
         auto i = from.begin();
         auto j = to.begin();
         for (; i != from.end(); ++i, ++j)
             if (s.compare(p, i->size(), *i) == 0) {
                 found = true;
-                p += i->size();
                 res += j->first;
+                if (i->empty()) {
+                    if (p < s.size())
+                        res += s[p];
+                    p++;
+                } else {
+                    p += i->size();
+                }
                 for (auto& path : j->second)
                     context.insert(path);
                 j->second.clear();
                 break;
             }
-        if (!found) res += s[p++];
+        if (!found) {
+            if (p < s.size())
+                res += s[p];
+            p++;
+        }
     }
 
     mkString(v, res, context);
@@ -1901,17 +1973,37 @@ static void prim_compareVersions(EvalState & state, const Pos & pos, Value * * a
 }
 
 
+static void prim_splitVersion(EvalState & state, const Pos & pos, Value * * args, Value & v)
+{
+    string version = state.forceStringNoCtx(*args[0], pos);
+    auto iter = version.cbegin();
+    Strings components;
+    while (iter != version.cend()) {
+        auto component = nextComponent(iter, version.cend());
+        if (component.empty())
+            break;
+        components.emplace_back(std::move(component));
+    }
+    state.mkList(v, components.size());
+    unsigned int n = 0;
+    for (auto & component : components) {
+        auto listElem = v.listElems()[n++] = state.allocValue();
+        mkString(*listElem, std::move(component));
+    }
+}
+
+
 /*************************************************************
  * Networking
  *************************************************************/
 
 
 void fetch(EvalState & state, const Pos & pos, Value * * args, Value & v,
-    const string & who, bool unpack)
+    const string & who, bool unpack, const std::string & defaultName)
 {
     string url;
     Hash expectedHash;
-    string name;
+    string name = defaultName;
 
     state.forceValue(*args[0]);
 
@@ -1937,23 +2029,29 @@ void fetch(EvalState & state, const Pos & pos, Value * * args, Value & v,
     } else
         url = state.forceStringNoCtx(*args[0], pos);
 
-    if (state.restricted && !expectedHash)
-        throw Error(format("'%1%' is not allowed in restricted mode") % who);
+    state.checkURI(url);
+
+    if (settings.pureEval && !expectedHash)
+        throw Error("in pure evaluation mode, '%s' requires a 'sha256' argument", who);
 
     Path res = getDownloader()->downloadCached(state.store, url, unpack, name, expectedHash);
+
+    if (state.allowedPaths)
+        state.allowedPaths->insert(res);
+
     mkString(v, res, PathSet({res}));
 }
 
 
 static void prim_fetchurl(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
-    fetch(state, pos, args, v, "fetchurl", false);
+    fetch(state, pos, args, v, "fetchurl", false, "");
 }
 
 
 static void prim_fetchTarball(EvalState & state, const Pos & pos, Value * * args, Value & v)
 {
-    fetch(state, pos, args, v, "fetchTarball", true);
+    fetch(state, pos, args, v, "fetchTarball", true, "source");
 }
 
 
@@ -1992,11 +2090,24 @@ void EvalState::createBaseEnv()
     mkNull(v);
     addConstant("null", v);
 
-    mkInt(v, time(0));
-    addConstant("__currentTime", v);
+    auto vThrow = addPrimOp("throw", 1, prim_throw);
 
-    mkString(v, settings.thisSystem);
-    addConstant("__currentSystem", v);
+    auto addPurityError = [&](const std::string & name) {
+        Value * v2 = allocValue();
+        mkString(*v2, fmt("'%s' is not allowed in pure evaluation mode", name));
+        mkApp(v, *vThrow, *v2);
+        addConstant(name, v);
+    };
+
+    if (!settings.pureEval) {
+        mkInt(v, time(0));
+        addConstant("__currentTime", v);
+    }
+
+    if (!settings.pureEval) {
+        mkString(v, settings.thisSystem);
+        addConstant("__currentSystem", v);
+    }
 
     mkString(v, nixVersion);
     addConstant("__nixVersion", v);
@@ -2008,14 +2119,14 @@ void EvalState::createBaseEnv()
        language feature gets added.  It's not necessary to increase it
        when primops get added, because you can just use `builtins ?
        primOp' to check. */
-    mkInt(v, 4);
+    mkInt(v, 5);
     addConstant("__langVersion", v);
 
     // Miscellaneous
-    addPrimOp("scopedImport", 2, prim_scopedImport);
+    auto vScopedImport = addPrimOp("scopedImport", 2, prim_scopedImport);
     Value * v2 = allocValue();
     mkAttrs(*v2, 0);
-    mkApp(v, *baseEnv.values[baseEnvDispl - 1], *v2);
+    mkApp(v, *vScopedImport, *v2);
     forceValue(v);
     addConstant("import", v);
     if (settings.enableNativeCode) {
@@ -2031,7 +2142,6 @@ void EvalState::createBaseEnv()
     addPrimOp("__isBool", 1, prim_isBool);
     addPrimOp("__genericClosure", 1, prim_genericClosure);
     addPrimOp("abort", 1, prim_abort);
-    addPrimOp("throw", 1, prim_throw);
     addPrimOp("__addErrorContext", 2, prim_addErrorContext);
     addPrimOp("__tryEval", 1, prim_tryEval);
     addPrimOp("__getEnv", 1, prim_getEnv);
@@ -2046,7 +2156,10 @@ void EvalState::createBaseEnv()
 
     // Paths
     addPrimOp("__toPath", 1, prim_toPath);
-    addPrimOp("__storePath", 1, prim_storePath);
+    if (settings.pureEval)
+        addPurityError("__storePath");
+    else
+        addPrimOp("__storePath", 1, prim_storePath);
     addPrimOp("__pathExists", 1, prim_pathExists);
     addPrimOp("baseNameOf", 1, prim_baseNameOf);
     addPrimOp("dirOf", 1, prim_dirOf);
@@ -2060,6 +2173,7 @@ void EvalState::createBaseEnv()
     addPrimOp("__fromJSON", 1, prim_fromJSON);
     addPrimOp("__toFile", 2, prim_toFile);
     addPrimOp("__filterSource", 2, prim_filterSource);
+    addPrimOp("__path", 1, prim_path);
 
     // Sets
     addPrimOp("__attrNames", 1, prim_attrNames);
@@ -2102,6 +2216,7 @@ void EvalState::createBaseEnv()
     addPrimOp("toString", 1, prim_toString);
     addPrimOp("__substring", 3, prim_substring);
     addPrimOp("__stringLength", 1, prim_stringLength);
+    addPrimOp("__hasContext", 1, prim_hasContext);
     addPrimOp("__unsafeDiscardStringContext", 1, prim_unsafeDiscardStringContext);
     addPrimOp("__unsafeDiscardOutputDependency", 1, prim_unsafeDiscardOutputDependency);
     addPrimOp("__hashString", 2, prim_hashString);
@@ -2113,6 +2228,7 @@ void EvalState::createBaseEnv()
     // Versions
     addPrimOp("__parseDrvName", 1, prim_parseDrvName);
     addPrimOp("__compareVersions", 2, prim_compareVersions);
+    addPrimOp("__splitVersion", 1, prim_splitVersion);
 
     // Derivations
     addPrimOp("derivationStrict", 1, prim_derivationStrict);
@@ -2124,7 +2240,7 @@ void EvalState::createBaseEnv()
 
     /* Add a wrapper around the derivation primop that computes the
        `drvPath' and `outPath' attributes lazily. */
-    string path = settings.nixDataDir + "/nix/corepkgs/derivation.nix";
+    string path = canonPath(settings.nixDataDir + "/nix/corepkgs/derivation.nix", true);
     sDerivationNix = symbols.create(path);
     evalFile(path, v);
     addConstant("derivation", v);

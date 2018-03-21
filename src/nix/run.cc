@@ -16,11 +16,9 @@ using namespace nix;
 
 std::string chrootHelperName = "__run_in_chroot";
 
-extern char * * environ;
-
 struct CmdRun : InstallablesCommand
 {
-    Strings command = { "bash" };
+    std::vector<std::string> command = { "bash" };
     StringSet keep, unset;
     bool ignoreEnvironment = false;
 
@@ -30,9 +28,9 @@ struct CmdRun : InstallablesCommand
             .longName("command")
             .shortName('c')
             .description("command and arguments to be executed; defaults to 'bash'")
-            .arity(ArityAny)
             .labels({"command", "args"})
-            .handler([&](Strings ss) {
+            .arity(ArityAny)
+            .handler([&](std::vector<std::string> ss) {
                 if (ss.empty()) throw UsageError("--command requires at least one argument");
                 command = ss;
             });
@@ -49,7 +47,7 @@ struct CmdRun : InstallablesCommand
             .description("keep specified environment variable")
             .arity(1)
             .labels({"name"})
-            .handler([&](Strings ss) { keep.insert(ss.front()); });
+            .handler([&](std::vector<std::string> ss) { keep.insert(ss.front()); });
 
         mkFlag()
             .longName("unset")
@@ -57,7 +55,7 @@ struct CmdRun : InstallablesCommand
             .description("unset specified environment variable")
             .arity(1)
             .labels({"name"})
-            .handler([&](Strings ss) { unset.insert(ss.front()); });
+            .handler([&](std::vector<std::string> ss) { unset.insert(ss.front()); });
     }
 
     std::string name() override
@@ -85,6 +83,10 @@ struct CmdRun : InstallablesCommand
                 "To run GNU Hello:",
                 "nix run nixpkgs.hello -c hello --greeting 'Hi everybody!'"
             },
+            Example{
+                "To run GNU Hello in a chroot store:",
+                "nix run --store ~/my-nix nixpkgs.hello -c hello"
+            },
         };
     }
 
@@ -105,7 +107,7 @@ struct CmdRun : InstallablesCommand
                 if (s) kept[var] = s;
             }
 
-            environ = nullptr;
+            clearEnv();
 
             for (auto & var : kept)
                 setenv(var.first.c_str(), var.second.c_str(), 1);
@@ -126,9 +128,12 @@ struct CmdRun : InstallablesCommand
         setenv("PATH", concatStringsSep(":", unixPath).c_str(), 1);
 
         std::string cmd = *command.begin();
-        Strings args = command;
+        Strings args;
+        for (auto & arg : command) args.push_back(arg);
 
         stopProgressBar();
+
+        restoreSignals();
 
         /* If this is a diverted store (i.e. its "logical" location
            (typically /nix/store) differs from its "physical" location
@@ -181,7 +186,7 @@ void chrootHelper(int argc, char * * argv)
        but that doesn't work in a user namespace yet (Ubuntu has a
        patch for this:
        https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1478578). */
-    if (true /* !pathExists(storeDir) */) {
+    if (!pathExists(storeDir)) {
         // FIXME: Use overlayfs?
 
         Path tmpDir = createTempDir();
@@ -192,12 +197,15 @@ void chrootHelper(int argc, char * * argv)
             throw SysError("mounting '%s' on '%s'", realStoreDir, storeDir);
 
         for (auto entry : readDirectory("/")) {
+            auto src = "/" + entry.name;
+            auto st = lstat(src);
+            if (!S_ISDIR(st.st_mode)) continue;
             Path dst = tmpDir + "/" + entry.name;
             if (pathExists(dst)) continue;
             if (mkdir(dst.c_str(), 0700) == -1)
-                throw SysError(format("creating directory '%s'") % dst);
-            if (mount(("/" + entry.name).c_str(), dst.c_str(), "", MS_BIND | MS_REC, 0) == -1)
-                throw SysError(format("mounting '%s' on '%s'") %  ("/" + entry.name) % dst);
+                throw SysError("creating directory '%s'", dst);
+            if (mount(src.c_str(), dst.c_str(), "", MS_BIND | MS_REC, 0) == -1)
+                throw SysError("mounting '%s' on '%s'", src, dst);
         }
 
         char * cwd = getcwd(0, 0);

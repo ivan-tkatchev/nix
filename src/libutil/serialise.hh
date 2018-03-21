@@ -56,11 +56,13 @@ struct Source
     void operator () (unsigned char * data, size_t len);
 
     /* Store up to ‘len’ in the buffer pointed to by ‘data’, and
-       return the number of bytes stored.  If blocks until at least
+       return the number of bytes stored.  It blocks until at least
        one byte is available. */
     virtual size_t read(unsigned char * data, size_t len) = 0;
 
     virtual bool good() { return true; }
+
+    std::string drain();
 };
 
 
@@ -92,7 +94,17 @@ struct FdSink : BufferedSink
     FdSink() : fd(-1) { }
     FdSink(int fd) : fd(fd) { }
     FdSink(FdSink&&) = default;
-    FdSink& operator=(FdSink&&) = default;
+
+    FdSink& operator=(FdSink && s)
+    {
+        flush();
+        fd = s.fd;
+        s.fd = -1;
+        warn = s.warn;
+        written = s.written;
+        return *this;
+    }
+
     ~FdSink();
 
     void write(const unsigned char * data, size_t len) override;
@@ -112,6 +124,16 @@ struct FdSource : BufferedSource
 
     FdSource() : fd(-1) { }
     FdSource(int fd) : fd(fd) { }
+    FdSource(FdSource&&) = default;
+
+    FdSource& operator=(FdSource && s)
+    {
+        fd = s.fd;
+        s.fd = -1;
+        read = s.read;
+        return *this;
+    }
+
     size_t readUnbuffered(unsigned char * data, size_t len) override;
     bool good() override;
 private:
@@ -153,6 +175,43 @@ struct TeeSource : Source
         return n;
     }
 };
+
+
+/* Convert a function into a sink. */
+struct LambdaSink : Sink
+{
+    typedef std::function<void(const unsigned char *, size_t)> lambda_t;
+
+    lambda_t lambda;
+
+    LambdaSink(const lambda_t & lambda) : lambda(lambda) { }
+
+    virtual void operator () (const unsigned char * data, size_t len)
+    {
+        lambda(data, len);
+    }
+};
+
+
+/* Convert a function into a source. */
+struct LambdaSource : Source
+{
+    typedef std::function<size_t(unsigned char *, size_t)> lambda_t;
+
+    lambda_t lambda;
+
+    LambdaSource(const lambda_t & lambda) : lambda(lambda) { }
+
+    size_t read(unsigned char * data, size_t len) override
+    {
+        return lambda(data, len);
+    }
+};
+
+
+/* Convert a function that feeds data into a Sink into a Source. The
+   Source executes the function as a coroutine. */
+std::unique_ptr<Source> sinkToSource(std::function<void(Sink &)> fun);
 
 
 void writePadding(size_t len, Sink & sink);

@@ -17,66 +17,6 @@
 
 namespace nix {
 
-/* Given requests for a path /nix/store/<x>/<y>, this accessor will
-   first download the NAR for /nix/store/<x> from the binary cache,
-   build a NAR accessor for that NAR, and use that to access <y>. */
-struct BinaryCacheStoreAccessor : public FSAccessor
-{
-    ref<BinaryCacheStore> store;
-
-    std::map<Path, ref<FSAccessor>> nars;
-
-    BinaryCacheStoreAccessor(ref<BinaryCacheStore> store)
-        : store(store)
-    {
-    }
-
-    std::pair<ref<FSAccessor>, Path> fetch(const Path & path_)
-    {
-        auto path = canonPath(path_);
-
-        auto storePath = store->toStorePath(path);
-        std::string restPath = std::string(path, storePath.size());
-
-        if (!store->isValidPath(storePath))
-            throw InvalidPath(format("path '%1%' is not a valid store path") % storePath);
-
-        auto i = nars.find(storePath);
-        if (i != nars.end()) return {i->second, restPath};
-
-        StringSink sink;
-        store->narFromPath(storePath, sink);
-
-        auto accessor = makeNarAccessor(sink.s);
-        nars.emplace(storePath, accessor);
-        return {accessor, restPath};
-    }
-
-    Stat stat(const Path & path) override
-    {
-        auto res = fetch(path);
-        return res.first->stat(res.second);
-    }
-
-    StringSet readDirectory(const Path & path) override
-    {
-        auto res = fetch(path);
-        return res.first->readDirectory(res.second);
-    }
-
-    std::string readFile(const Path & path) override
-    {
-        auto res = fetch(path);
-        return res.first->readFile(res.second);
-    }
-
-    std::string readLink(const Path & path) override
-    {
-        auto res = fetch(path);
-        return res.first->readLink(res.second);
-    }
-};
-
 BinaryCacheStore::BinaryCacheStore(const Params & params)
     : Store(params)
 {
@@ -133,6 +73,23 @@ Path BinaryCacheStore::narInfoFileFor(const Path & storePath)
     return storePathToHash(storePath) + ".narinfo";
 }
 
+void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
+{
+    auto narInfoFile = narInfoFileFor(narInfo->path);
+
+    upsertFile(narInfoFile, narInfo->to_string(), "text/x-nix-narinfo");
+
+    auto hashPart = storePathToHash(narInfo->path);
+
+    {
+        auto state_(state.lock());
+        state_->pathInfoCache.upsert(hashPart, std::shared_ptr<NarInfo>(narInfo));
+    }
+
+    if (diskCache)
+        diskCache->upsertNarInfo(getUri(), hashPart, std::shared_ptr<NarInfo>(narInfo));
+}
+
 void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::string> & nar,
     RepairFlag repair, CheckSigsFlag checkSigs, std::shared_ptr<FSAccessor> accessor)
 {
@@ -149,8 +106,6 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
                 % info.path % ref);
         }
 
-    auto narInfoFile = narInfoFileFor(info.path);
-
     assert(nar->compare(0, narMagic.size(), narMagic) == 0);
 
     auto narInfo = make_ref<NarInfo>(info);
@@ -161,7 +116,7 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
     if (info.narHash && info.narHash != narInfo->narHash)
         throw Error(format("refusing to copy corrupted path '%1%' to binary cache") % info.path);
 
-    auto accessor_ = std::dynamic_pointer_cast<BinaryCacheStoreAccessor>(accessor);
+    auto accessor_ = std::dynamic_pointer_cast<RemoteFSAccessor>(accessor);
 
     /* Optionally write a JSON file containing a listing of the
        contents of the NAR. */
@@ -175,44 +130,11 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
             auto narAccessor = makeNarAccessor(nar);
 
             if (accessor_)
-                accessor_->nars.emplace(info.path, narAccessor);
-
-            std::function<void(const Path &, JSONPlaceholder &)> recurse;
-
-            recurse = [&](const Path & path, JSONPlaceholder & res) {
-                auto st = narAccessor->stat(path);
-
-                auto obj = res.object();
-
-                switch (st.type) {
-                case FSAccessor::Type::tRegular:
-                    obj.attr("type", "regular");
-                    obj.attr("size", st.fileSize);
-                    if (st.isExecutable)
-                        obj.attr("executable", true);
-                    break;
-                case FSAccessor::Type::tDirectory:
-                    obj.attr("type", "directory");
-                    {
-                        auto res2 = obj.object("entries");
-                        for (auto & name : narAccessor->readDirectory(path)) {
-                            auto res3 = res2.placeholder(name);
-                            recurse(path + "/" + name, res3);
-                        }
-                    }
-                    break;
-                case FSAccessor::Type::tSymlink:
-                    obj.attr("type", "symlink");
-                    obj.attr("target", narAccessor->readLink(path));
-                    break;
-                default:
-                    abort();
-                }
-            };
+                accessor_->addToCache(info.path, *nar, narAccessor);
 
             {
                 auto res = jsonRoot.placeholder("root");
-                recurse("", res);
+                listNar(res, narAccessor, "", true);
             }
         }
 
@@ -221,13 +143,13 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
 
     else {
         if (accessor_)
-            accessor_->nars.emplace(info.path, makeNarAccessor(nar));
+            accessor_->addToCache(info.path, *nar, makeNarAccessor(nar));
     }
 
     /* Compress the NAR. */
     narInfo->compression = compression;
     auto now1 = std::chrono::steady_clock::now();
-    auto narCompressed = compress(compression, *nar);
+    auto narCompressed = compress(compression, *nar, parallelCompression);
     auto now2 = std::chrono::steady_clock::now();
     narInfo->fileHash = hashString(htSHA256, *narCompressed);
     narInfo->fileSize = narCompressed->size();
@@ -257,17 +179,7 @@ void BinaryCacheStore::addToStore(const ValidPathInfo & info, const ref<std::str
     /* Atomically write the NAR info file.*/
     if (secretKey) narInfo->sign(*secretKey);
 
-    upsertFile(narInfoFile, narInfo->to_string(), "text/x-nix-narinfo");
-
-    auto hashPart = storePathToHash(narInfo->path);
-
-    {
-        auto state_(state.lock());
-        state_->pathInfoCache.upsert(hashPart, std::shared_ptr<NarInfo>(narInfo));
-    }
-
-    if (diskCache)
-        diskCache->upsertNarInfo(getUri(), hashPart, std::shared_ptr<NarInfo>(narInfo));
+    writeNarInfo(narInfo);
 
     stats.narInfoWrite++;
 }
@@ -291,22 +203,18 @@ void BinaryCacheStore::narFromPath(const Path & storePath, Sink & sink)
     stats.narRead++;
     stats.narReadCompressedBytes += nar->size();
 
-    /* Decompress the NAR. FIXME: would be nice to have the remote
-       side do this. */
-    try {
-        nar = decompress(info->compression, *nar);
-    } catch (UnknownCompressionMethod &) {
-        throw Error(format("binary cache path '%s' uses unknown compression method '%s'")
-            % storePath % info->compression);
-    }
+    uint64_t narSize = 0;
 
-    stats.narReadBytes += nar->size();
+    StringSource source(*nar);
 
-    printMsg(lvlTalkative, format("exporting path '%1%' (%2% bytes)") % storePath % nar->size());
+    LambdaSink wrapperSink([&](const unsigned char * data, size_t len) {
+        sink(data, len);
+        narSize += len;
+    });
 
-    assert(nar->size() % 8 == 0);
+    decompress(info->compression, source, wrapperSink);
 
-    sink((unsigned char *) nar->c_str(), nar->size());
+    stats.narReadBytes += narSize;
 }
 
 void BinaryCacheStore::queryPathInfoUncached(const Path & storePath,
@@ -379,7 +287,23 @@ Path BinaryCacheStore::addTextToStore(const string & name, const string & s,
 
 ref<FSAccessor> BinaryCacheStore::getFSAccessor()
 {
-    return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()));
+    return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()), localNarCache);
+}
+
+void BinaryCacheStore::addSignatures(const Path & storePath, const StringSet & sigs)
+{
+    /* Note: this is inherently racy since there is no locking on
+       binary caches. In particular, with S3 this unreliable, even
+       when addSignatures() is called sequentially on a path, because
+       S3 might return an outdated cached version. */
+
+    auto narInfo = make_ref<NarInfo>((NarInfo &) *queryPathInfo(storePath));
+
+    narInfo->sigs.insert(sigs.begin(), sigs.end());
+
+    auto narInfoFile = narInfoFileFor(narInfo->path);
+
+    writeNarInfo(narInfo);
 }
 
 std::shared_ptr<std::string> BinaryCacheStore::getBuildLog(const Path & path)

@@ -16,27 +16,35 @@ void chrootHelper(int argc, char * * argv);
 
 namespace nix {
 
+std::string programPath;
+
 struct NixArgs : virtual MultiCommand, virtual MixCommonArgs
 {
     NixArgs() : MultiCommand(*RegisterCommand::commands), MixCommonArgs("nix")
     {
-        mkFlag('h', "help", "show usage information", [&]() { showHelpAndExit(); });
+        mkFlag()
+            .longName("help")
+            .shortName('h')
+            .description("show usage information")
+            .handler([&]() { showHelpAndExit(); });
 
-        mkFlag(0, "help-config", "show configuration options", [=]() {
-            std::cout << "The following configuration options are available:\n\n";
-            Table2 tbl;
-            for (const auto & s : settings._getSettings())
-                if (!s.second.isAlias)
-                    tbl.emplace_back(s.first, s.second.setting->description);
-            printTable(std::cout, tbl);
-            throw Exit();
-        });
+        mkFlag()
+            .longName("help-config")
+            .description("show configuration options")
+            .handler([&]() {
+                std::cout << "The following configuration options are available:\n\n";
+                Table2 tbl;
+                for (const auto & s : settings._getSettings())
+                    if (!s.second.isAlias)
+                        tbl.emplace_back(s.first, s.second.setting->description);
+                printTable(std::cout, tbl);
+                throw Exit();
+            });
 
-        mkFlag(0, "version", "show version information", std::bind(printVersion, programName));
-
-        std::string cat = "config";
-        settings.convertToArgs(*this, cat);
-        hiddenCategories.insert(cat);
+        mkFlag()
+            .longName("version")
+            .description("show version information")
+            .handler([&]() { printVersion(programName); });
     }
 
     void printFlags(std::ostream & out) override
@@ -72,7 +80,8 @@ void mainWrapped(int argc, char * * argv)
     initNix();
     initGC();
 
-    string programName = baseNameOf(argv[0]);
+    programPath = argv[0];
+    string programName = baseNameOf(programPath);
 
     {
         auto legacy = (*RegisterLegacyCommand::commands)[programName];
@@ -82,6 +91,8 @@ void mainWrapped(int argc, char * * argv)
     NixArgs args;
 
     args.parseCmdline(argvToStrings(argc, argv));
+
+    initPlugins();
 
     if (!args.command) args.showHelpAndExit();
 

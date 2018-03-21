@@ -18,6 +18,9 @@ public:
     const Setting<std::string> compression{this, "xz", "compression", "NAR compression method ('xz', 'bzip2', or 'none')"};
     const Setting<bool> writeNARListing{this, false, "write-nar-listing", "whether to write a JSON file listing the files in each NAR"};
     const Setting<Path> secretKeyFile{this, "", "secret-key", "path to secret key used to sign the binary cache"};
+    const Setting<Path> localNarCache{this, "", "local-nar-cache", "path to a local cache of NARs"};
+    const Setting<bool> parallelCompression{this, false, "parallel-compression",
+        "enable multi-threading compression, available for xz only currently"};
 
 private:
 
@@ -57,6 +60,8 @@ private:
     std::string narMagic;
 
     std::string narInfoFileFor(const Path & storePath);
+
+    void writeNarInfo(ref<NarInfo> narInfo);
 
 public:
 
@@ -118,8 +123,7 @@ public:
 
     ref<FSAccessor> getFSAccessor() override;
 
-    void addSignatures(const Path & storePath, const StringSet & sigs) override
-    { unsupported(); }
+    void addSignatures(const Path & storePath, const StringSet & sigs) override;
 
     std::shared_ptr<std::string> getBuildLog(const Path & path) override;
 

@@ -4,11 +4,18 @@ libstore_NAME = libnixstore
 
 libstore_DIR := $(d)
 
-libstore_SOURCES := $(wildcard $(d)/*.cc)
+libstore_SOURCES := $(wildcard $(d)/*.cc $(d)/builtins/*.cc)
 
 libstore_LIBS = libutil libformat
 
 libstore_LDFLAGS = $(SQLITE3_LIBS) -lbz2 $(LIBCURL_LIBS) $(SODIUM_LIBS) -pthread
+ifneq ($(OS), FreeBSD)
+ libstore_LDFLAGS += -ldl
+endif
+
+libstore_FILES = sandbox-defaults.sb sandbox-minimal.sb sandbox-network.sb
+
+$(foreach file,$(libstore_FILES),$(eval $(call install-data-in,$(d)/$(file),$(datadir)/nix/sandbox)))
 
 ifeq ($(ENABLE_S3), 1)
 	libstore_LDFLAGS += -laws-cpp-sdk-s3 -laws-cpp-sdk-core
@@ -18,7 +25,7 @@ ifeq ($(OS), SunOS)
 	libstore_LDFLAGS += -lsocket
 endif
 
-ifeq ($(OS), Linux)
+ifeq ($(HAVE_SECCOMP), 1)
 	libstore_LDFLAGS += -lseccomp
 endif
 
@@ -31,14 +38,13 @@ libstore_CXXFLAGS = \
  -DNIX_CONF_DIR=\"$(sysconfdir)/nix\" \
  -DNIX_LIBEXEC_DIR=\"$(libexecdir)\" \
  -DNIX_BIN_DIR=\"$(bindir)\" \
+ -DNIX_MAN_DIR=\"$(mandir)\" \
  -DSANDBOX_SHELL="\"$(sandbox_shell)\"" \
  -DLSOF=\"$(lsof)\"
 
 $(d)/local-store.cc: $(d)/schema.sql.gen.hh
 
-sandbox-headers = $(d)/sandbox-defaults.sb.gen.hh $(d)/sandbox-network.sb.gen.hh $(d)/sandbox-minimal.sb.gen.hh
-
-$(d)/build.cc: $(sandbox-headers)
+$(d)/build.cc:
 
 %.gen.hh: %
 	@echo 'R"foo(' >> $@.tmp
@@ -46,6 +52,6 @@ $(d)/build.cc: $(sandbox-headers)
 	@echo ')foo"' >> $@.tmp
 	@mv $@.tmp $@
 
-clean-files += $(d)/schema.sql.gen.hh $(sandbox-headers)
+clean-files += $(d)/schema.sql.gen.hh
 
 $(eval $(call install-file-in, $(d)/nix-store.pc, $(prefix)/lib/pkgconfig, 0644))

@@ -17,11 +17,15 @@
 
 #include <curl/curl.h>
 
-#include <queue>
-#include <iostream>
-#include <thread>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iostream>
+#include <queue>
 #include <random>
+#include <thread>
+
+using namespace std::string_literals;
 
 namespace nix {
 
@@ -89,6 +93,8 @@ struct CurlDownloader : public Downloader
         {
             if (!request.expectedETag.empty())
                 requestHeaders = curl_slist_append(requestHeaders, ("If-None-Match: " + request.expectedETag).c_str());
+            if (!request.mimeType.empty())
+                requestHeaders = curl_slist_append(requestHeaders, ("Content-Type: " + request.mimeType).c_str());
         }
 
         ~DownloadItem()
@@ -183,6 +189,23 @@ struct CurlDownloader : public Downloader
             return 0;
         }
 
+        size_t readOffset = 0;
+        int readCallback(char *buffer, size_t size, size_t nitems)
+        {
+            if (readOffset == request.data->length())
+                return 0;
+            auto count = std::min(size * nitems, request.data->length() - readOffset);
+            assert(count);
+            memcpy(buffer, request.data->data() + readOffset, count);
+            readOffset += count;
+            return count;
+        }
+
+        static int readCallbackWrapper(char *buffer, size_t size, size_t nitems, void * userp)
+        {
+            return ((DownloadItem *) userp)->readCallback(buffer, size, nitems);
+        }
+
         long lowSpeedTimeout = 300;
 
         void init()
@@ -222,6 +245,13 @@ struct CurlDownloader : public Downloader
 
             if (request.head)
                 curl_easy_setopt(req, CURLOPT_NOBODY, 1);
+
+            if (request.data) {
+                curl_easy_setopt(req, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(req, CURLOPT_READFUNCTION, readCallbackWrapper);
+                curl_easy_setopt(req, CURLOPT_READDATA, this);
+                curl_easy_setopt(req, CURLOPT_INFILESIZE_LARGE, (curl_off_t) request.data->length());
+            }
 
             if (request.verifyTLS) {
                 if (settings.caFile != "")
@@ -263,13 +293,14 @@ struct CurlDownloader : public Downloader
             }
 
             if (code == CURLE_OK &&
-                (httpStatus == 200 || httpStatus == 304 || httpStatus == 226 /* FTP */ || httpStatus == 0 /* other protocol */))
+                (httpStatus == 200 || httpStatus == 201 || httpStatus == 204 || httpStatus == 304 || httpStatus == 226 /* FTP */ || httpStatus == 0 /* other protocol */))
             {
                 result.cached = httpStatus == 304;
                 done = true;
 
                 try {
-                    result.data = decodeContent(encoding, ref<std::string>(result.data));
+                    if (request.decompress)
+                        result.data = decodeContent(encoding, ref<std::string>(result.data));
                     callSuccess(success, failure, const_cast<const DownloadResult &>(result));
                     act.progress(result.data->size(), result.data->size());
                 } catch (...) {
@@ -277,26 +308,45 @@ struct CurlDownloader : public Downloader
                     callFailure(failure, std::current_exception());
                 }
             } else {
-                Error err =
-                    (httpStatus == 404 || code == CURLE_FILE_COULDNT_READ_FILE) ? NotFound :
-                    httpStatus == 403 ? Forbidden :
-                    (httpStatus == 408 || httpStatus == 500 || httpStatus == 503
-                        || httpStatus == 504  || httpStatus == 522 || httpStatus == 524
-                        || code == CURLE_COULDNT_RESOLVE_HOST
-                        || code == CURLE_RECV_ERROR
+                // We treat most errors as transient, but won't retry when hopeless
+                Error err = Transient;
 
-                        // this seems to occur occasionally for retriable reasons, and shows up in an error like this:
-                        //   curl: (23) Failed writing body (315 != 16366)
-                        || code == CURLE_WRITE_ERROR
-
-                        // this is a generic SSL failure that in some cases (e.g., certificate error) is permanent but also appears in transient cases, so we consider it retryable
-                        || code == CURLE_SSL_CONNECT_ERROR
-#if LIBCURL_VERSION_NUM >= 0x073200
-                        || code == CURLE_HTTP2
-                        || code == CURLE_HTTP2_STREAM
-#endif
-                        ) ? Transient :
-                    Misc;
+                if (httpStatus == 404 || code == CURLE_FILE_COULDNT_READ_FILE) {
+                    // The file is definitely not there
+                    err = NotFound;
+                } else if (httpStatus == 401 || httpStatus == 403 || httpStatus == 407) {
+                    // Don't retry on authentication/authorization failures
+                    err = Forbidden;
+                } else if (httpStatus >= 400 && httpStatus < 500 && httpStatus != 408) {
+                    // Most 4xx errors are client errors and are probably not worth retrying:
+                    //   * 408 means the server timed out waiting for us, so we try again
+                    err = Misc;
+                } else if (httpStatus == 501 || httpStatus == 505 || httpStatus == 511) {
+                    // Let's treat most 5xx (server) errors as transient, except for a handful:
+                    //   * 501 not implemented
+                    //   * 505 http version not supported
+                    //   * 511 we're behind a captive portal
+                    err = Misc;
+                } else {
+                    // Don't bother retrying on certain cURL errors either
+                    switch (code) {
+                        case CURLE_FAILED_INIT:
+                        case CURLE_URL_MALFORMAT:
+                        case CURLE_NOT_BUILT_IN:
+                        case CURLE_REMOTE_ACCESS_DENIED:
+                        case CURLE_FILE_COULDNT_READ_FILE:
+                        case CURLE_FUNCTION_NOT_FOUND:
+                        case CURLE_ABORTED_BY_CALLBACK:
+                        case CURLE_BAD_FUNCTION_ARGUMENT:
+                        case CURLE_INTERFACE_FAILED:
+                        case CURLE_UNKNOWN_OPTION:
+                        case CURLE_SSL_CACERT_BADFILE:
+                            err = Misc;
+                            break;
+                        default: // Shut up warnings
+                            break;
+                    }
+                }
 
                 attempt++;
 
@@ -349,11 +399,13 @@ struct CurlDownloader : public Downloader
 
         curlm = curl_multi_init();
 
-        #if LIBCURL_VERSION_NUM >= 0x072b00 // correct?
+        #if LIBCURL_VERSION_NUM >= 0x072b00 // Multiplex requires >= 7.43.0
         curl_multi_setopt(curlm, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
         #endif
+        #if LIBCURL_VERSION_NUM >= 0x071e00 // Max connections requires >= 7.30.0
         curl_multi_setopt(curlm, CURLMOPT_MAX_TOTAL_CONNECTIONS,
             settings.binaryCachesParallelConnections.get());
+        #endif
 
         enableHttp2 = settings.enableHttp2;
 
@@ -513,7 +565,7 @@ struct CurlDownloader : public Downloader
             // FIXME: do this on a worker thread
             sync2async<DownloadResult>(success, failure, [&]() -> DownloadResult {
 #ifdef ENABLE_S3
-                S3Helper s3Helper(Aws::Region::US_EAST_1); // FIXME: make configurable
+                S3Helper s3Helper("", Aws::Region::US_EAST_1); // FIXME: make configurable
                 auto slash = request.uri.find('/', 5);
                 if (slash == std::string::npos)
                     throw nix::Error("bad S3 URI '%s'", request.uri);
@@ -586,7 +638,7 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
     Path cacheDir = getCacheDir() + "/nix/tarballs";
     createDirs(cacheDir);
 
-    string urlHash = hashString(htSHA256, url).to_string(Base32, false);
+    string urlHash = hashString(htSHA256, name + std::string("\0"s) + url).to_string(Base32, false);
 
     Path dataFile = cacheDir + "/" + urlHash + ".info";
     Path fileLink = cacheDir + "/" + urlHash + "-file";
@@ -667,7 +719,7 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
             Path tmpDir = createTempDir();
             AutoDelete autoDelete(tmpDir, true);
             // FIXME: this requires GNU tar for decompression.
-            runProgram("tar", true, {"xf", storePath, "-C", tmpDir, "--strip-components", "1"});
+            runProgram("tar", true, {"xf", store->toRealPath(storePath), "-C", tmpDir, "--strip-components", "1"});
             unpackedStorePath = store->addToStore(name, tmpDir, true, htSHA256, defaultPathFilter, NoRepair);
         }
         replaceSymlink(unpackedStorePath, unpackedLink);
@@ -677,7 +729,7 @@ Path Downloader::downloadCached(ref<Store> store, const string & url_, bool unpa
     if (expectedStorePath != "" && storePath != expectedStorePath)
         throw nix::Error("store path mismatch in file downloaded from '%s'", url);
 
-    return storePath;
+    return store->toRealPath(storePath);
 }
 
 
@@ -687,7 +739,7 @@ bool isUri(const string & s)
     size_t pos = s.find("://");
     if (pos == string::npos) return false;
     string scheme(s, 0, pos);
-    return scheme == "http" || scheme == "https" || scheme == "file" || scheme == "channel" || scheme == "git" || scheme == "s3";
+    return scheme == "http" || scheme == "https" || scheme == "file" || scheme == "channel" || scheme == "git" || scheme == "s3" || scheme == "ssh";
 }
 
 

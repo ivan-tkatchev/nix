@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <map>
 #include <thread>
+#include <dlfcn.h>
 
 
 namespace nix {
@@ -37,6 +38,7 @@ Settings::Settings()
     , nixConfDir(canonPath(getEnv("NIX_CONF_DIR", NIX_CONF_DIR)))
     , nixLibexecDir(canonPath(getEnv("NIX_LIBEXEC_DIR", NIX_LIBEXEC_DIR)))
     , nixBinDir(canonPath(getEnv("NIX_BIN_DIR", NIX_BIN_DIR)))
+    , nixManDir(canonPath(NIX_MAN_DIR))
     , nixDaemonSocketFile(canonPath(nixStateDir + DEFAULT_SOCKET_PATH))
 {
     buildUsersGroup = getuid() == 0 ? "nixbld" : "";
@@ -53,7 +55,12 @@ Settings::Settings()
 
     /* Backwards compatibility. */
     auto s = getEnv("NIX_REMOTE_SYSTEMS");
-    if (s != "") builderFiles = tokenizeString<Strings>(s, ":");
+    if (s != "") {
+        Strings ss;
+        for (auto & p : tokenizeString<Strings>(s, ":"))
+            ss.push_back("@" + p);
+        builders = concatStringsSep(" ", ss);
+    }
 
 #if defined(__linux__) && defined(SANDBOX_SHELL)
     sandboxPaths = tokenizeString<StringSet>("/bin/sh=" SANDBOX_SHELL);
@@ -111,17 +118,17 @@ template<> void BaseSetting<SandboxMode>::convertToArg(Args & args, const std::s
     args.mkFlag()
         .longName(name)
         .description("Enable sandboxing.")
-        .handler([=](Strings ss) { value = smEnabled; })
+        .handler([=](std::vector<std::string> ss) { override(smEnabled); })
         .category(category);
     args.mkFlag()
         .longName("no-" + name)
         .description("Disable sandboxing.")
-        .handler([=](Strings ss) { value = smDisabled; })
+        .handler([=](std::vector<std::string> ss) { override(smDisabled); })
         .category(category);
     args.mkFlag()
         .longName("relaxed-" + name)
         .description("Enable sandboxing, but allow builds to disable it.")
-        .handler([=](Strings ss) { value = smRelaxed; })
+        .handler([=](std::vector<std::string> ss) { override(smRelaxed); })
         .category(category);
 }
 
@@ -131,5 +138,47 @@ void MaxBuildJobsSetting::set(const std::string & str)
     else if (!string2Int(str, value))
         throw UsageError("configuration setting '%s' should be 'auto' or an integer", name);
 }
+
+
+void initPlugins()
+{
+    for (const auto & pluginFile : settings.pluginFiles.get()) {
+        Paths pluginFiles;
+        try {
+            auto ents = readDirectory(pluginFile);
+            for (const auto & ent : ents)
+                pluginFiles.emplace_back(pluginFile + "/" + ent.name);
+        } catch (SysError & e) {
+            if (e.errNo != ENOTDIR)
+                throw;
+            pluginFiles.emplace_back(pluginFile);
+        }
+        for (const auto & file : pluginFiles) {
+            /* handle is purposefully leaked as there may be state in the
+               DSO needed by the action of the plugin. */
+            void *handle =
+                dlopen(file.c_str(), RTLD_LAZY | RTLD_LOCAL);
+            if (!handle)
+                throw Error("could not dynamically open plugin file '%s%': %s%", file, dlerror());
+        }
+    }
+    /* We handle settings registrations here, since plugins can add settings */
+    if (RegisterSetting::settingRegistrations) {
+        for (auto & registration : *RegisterSetting::settingRegistrations)
+            settings.addSetting(registration);
+        delete RegisterSetting::settingRegistrations;
+    }
+    settings.handleUnknownSettings();
+}
+
+RegisterSetting::SettingRegistrations * RegisterSetting::settingRegistrations;
+
+RegisterSetting::RegisterSetting(AbstractSetting * s)
+{
+    if (!settingRegistrations)
+        settingRegistrations = new SettingRegistrations;
+    settingRegistrations->emplace_back(s);
+}
+
 
 }

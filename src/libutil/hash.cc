@@ -189,7 +189,9 @@ Hash::Hash(const std::string & s, HashType type)
 
     else if (size == base64Len()) {
         auto d = base64Decode(std::string(s, pos));
-        assert(d.size() == hashSize);
+        if (d.size() != hashSize)
+            throw BadHash("invalid base-64 hash '%s'", s);
+        assert(hashSize);
         memcpy(hash, d.data(), hashSize);
     }
 

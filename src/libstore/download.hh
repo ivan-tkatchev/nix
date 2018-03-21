@@ -17,9 +17,12 @@ struct DownloadRequest
     size_t tries = 5;
     unsigned int baseRetryTimeMs = 250;
     ActivityId parentAct;
+    bool decompress = true;
+    std::shared_ptr<std::string> data;
+    std::string mimeType;
 
     DownloadRequest(const std::string & uri)
-        : uri(uri), parentAct(curActivity) { }
+        : uri(uri), parentAct(getCurActivity()) { }
 };
 
 struct DownloadResult

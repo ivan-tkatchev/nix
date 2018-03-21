@@ -1,10 +1,14 @@
 #pragma once
 
 #include "args.hh"
+#include "common-eval-args.hh"
 
 namespace nix {
 
+extern std::string programPath;
+
 struct Value;
+class Bindings;
 class EvalState;
 
 /* A command is an argument parser that can be executed by calling its
@@ -33,7 +37,6 @@ class Store;
 /* A command that require a Nix store. */
 struct StoreCommand : virtual Command
 {
-    std::string storeUri;
     StoreCommand();
     void run() override;
     ref<Store> getStore();
@@ -69,14 +72,11 @@ struct Installable
     }
 };
 
-struct SourceExprCommand : virtual Args, StoreCommand
+struct SourceExprCommand : virtual Args, StoreCommand, MixEvalArgs
 {
     Path file;
 
-    SourceExprCommand()
-    {
-        mkFlag('f', "file", "file", "evaluate FILE rather than the default", &file);
-    }
+    SourceExprCommand();
 
     /* Return a value representing the Nix expression from which we
        are installing. This is either the file specified by ‘--file’,
@@ -112,7 +112,7 @@ struct InstallablesCommand : virtual Args, SourceExprCommand
 
 private:
 
-    Strings _installables;
+    std::vector<std::string> _installables;
 };
 
 struct InstallableCommand : virtual Args, SourceExprCommand
@@ -141,7 +141,7 @@ private:
 
 public:
 
-    StorePathsCommand();
+    StorePathsCommand(bool recursive = false);
 
     using StoreCommand::run;
 
@@ -198,7 +198,7 @@ std::shared_ptr<Installable> parseInstallable(
     SourceExprCommand & cmd, ref<Store> store, const std::string & installable,
     bool useDefaultInstallables);
 
-Buildables toBuildables(ref<Store> store, RealiseMode mode,
+Buildables build(ref<Store> store, RealiseMode mode,
     std::vector<std::shared_ptr<Installable>> installables);
 
 PathSet toStorePaths(ref<Store> store, RealiseMode mode,
@@ -206,5 +206,9 @@ PathSet toStorePaths(ref<Store> store, RealiseMode mode,
 
 Path toStorePath(ref<Store> store, RealiseMode mode,
     std::shared_ptr<Installable> installable);
+
+PathSet toDerivations(ref<Store> store,
+    std::vector<std::shared_ptr<Installable>> installables,
+    bool useDeriver = false);
 
 }
